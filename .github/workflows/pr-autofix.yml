@@ -1,0 +1,710 @@
+name: PR Auto-Fix
+on:
+  workflow_run:
+    workflows: ["Parallel voting pipeline"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Workflow run ID to analyze (for testing)'
+        type: string
+        required: true
+      dry_run:
+        description: 'Dry run — analyze only, no commit'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+  checks: read
+
+env:
+  GH_HOST: github.tools.sap
+  MAX_RETRIES: 2
+
+jobs:
+  autofix:
+    runs-on: ["self-hosted", "solinas-large"]
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.event == 'pull_request')
+    steps:
+
+      # ── 1. Resolve PR and guard checks ──
+      - name: Resolve PR and check guards
+        id: guard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RUN_ID="${{ inputs.run_id }}"
+          else
+            RUN_ID="${{ github.event.workflow_run.id }}"
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+          PR_BRANCH=""
+          PR_NUMBER=""
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            PR_NUMBER=$(echo '${{ toJSON(github.event.workflow_run.pull_requests) }}' | jq -r '.[0].number // empty')
+            PR_BRANCH="${{ github.event.workflow_run.head_branch }}"
+          fi
+          if [ -z "$PR_NUMBER" ]; then
+            PR_BRANCH=$(gh api "repos/${{ github.repository }}/actions/runs/${RUN_ID}" --jq '.head_branch' 2>/dev/null || true)
+            PR_NUMBER=$(gh pr list --head "$PR_BRANCH" --state open --json number --jq '.[0].number' 2>/dev/null || true)
+          fi
+          if [ -z "$PR_NUMBER" ]; then
+            echo "::warning::No PR found. Skipping."
+            echo "should_fix=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if gh pr view "$PR_NUMBER" --json labels --jq '.labels[].name' 2>/dev/null | grep -qE '^(no-autofix|autofix-exhausted)$'; then
+            echo "Stop label found. Skipping."
+            echo "should_fix=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          AUTOFIX_COUNT=$(gh pr view "$PR_NUMBER" --json commits \
+            --jq '[.commits[] | select(.messageHeadline | startswith("[autofix]"))] | length' 2>/dev/null || echo 0)
+          ATTEMPT=$((AUTOFIX_COUNT + 1))
+
+          if [ "$AUTOFIX_COUNT" -ge "${{ env.MAX_RETRIES }}" ]; then
+            echo "Max retries reached ($AUTOFIX_COUNT). Adding exhausted label."
+            gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/labels" \
+              -X POST -f "labels[]=autofix-exhausted" > /dev/null 2>&1 || true
+            echo "should_fix=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$AUTOFIX_COUNT" -gt 0 ]; then
+            LAST_MSG=$(gh pr view "$PR_NUMBER" --json commits \
+              --jq '[.commits[] | select(.messageHeadline | startswith("[autofix]"))] | last | .messageHeadline' 2>/dev/null || true)
+            echo "Previous autofix: $LAST_MSG"
+            echo "prev_autofix_msg=$LAST_MSG" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "PR #$PR_NUMBER, branch=$PR_BRANCH, attempt=$ATTEMPT"
+          echo "should_fix=true" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "pr_branch=$PR_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "attempt=$ATTEMPT" >> "$GITHUB_OUTPUT"
+
+      # ── 2. Checkout PR branch ──
+      - name: Checkout PR branch
+        if: steps.guard.outputs.should_fix == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.guard.outputs.pr_branch }}
+          token: ${{ secrets.AUTOFIX_GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      # ── 3. Extract error logs and classify ──
+      - name: Extract and classify error logs
+        if: steps.guard.outputs.should_fix == 'true'
+        id: logs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RUN_ID="${{ steps.guard.outputs.run_id }}"
+          WORK="/tmp/autofix"
+          mkdir -p "$WORK"
+
+          gh api "repos/${{ github.repository }}/actions/runs/${RUN_ID}/logs" > "$WORK/logs.zip" 2>/dev/null
+          unzip -o -q "$WORK/logs.zip" -d "$WORK/logs" || true
+
+          gh api "repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs?per_page=100" > "$WORK/jobs.json"
+          FAILED_JOBS=$(jq -r '.jobs[] | select(.conclusion == "failure") | .name' "$WORK/jobs.json")
+          echo "Failed jobs: $FAILED_JOBS"
+
+          ERROR_LOG="$WORK/errors.txt"
+          > "$ERROR_LOG"
+          for JOB_NAME in $FAILED_JOBS; do
+            LOG_DIR=$(find "$WORK/logs" -maxdepth 1 -type d -name "*${JOB_NAME}*" | head -1)
+            if [ -n "$LOG_DIR" ]; then
+              echo "=== JOB: $JOB_NAME ===" >> "$ERROR_LOG"
+              cat "$LOG_DIR"/*.txt >> "$ERROR_LOG" 2>/dev/null || true
+            fi
+          done
+
+          SNIPPET=$(grep -A 5 -B 2 \
+            '\[ERROR\]\|BUILD FAILURE\|Tests run:.*Failures: [1-9]\|Tests run:.*Errors: [1-9]\|Rule violated\|cannot find symbol\|COMPILATION ERROR\|Quality Gate.*ERROR\|checkstyle\|SpotBugs\|spotbugs' \
+            "$ERROR_LOG" 2>/dev/null | head -200 || true)
+          [ -z "$SNIPPET" ] && SNIPPET=$(tail -200 "$ERROR_LOG")
+
+          FAILURE_TYPE="UNKNOWN"
+          if echo "$SNIPPET" | grep -qi "COMPILATION ERROR\|cannot find symbol\|incompatible types"; then
+            FAILURE_TYPE="BUILD_ERROR"
+          elif echo "$SNIPPET" | grep -qi "Tests run:.*Failures: [1-9]\|Tests run:.*Errors: [1-9]"; then
+            FAILURE_TYPE="TEST_FAILURE"
+          elif echo "$SNIPPET" | grep -qi "Rule violated\|Coverage checks"; then
+            FAILURE_TYPE="COVERAGE_FAILURE"
+          elif echo "$SNIPPET" | grep -qi "checkstyle\|SpotBugs\|spotbugs\|PMD"; then
+            FAILURE_TYPE="LINT_FAILURE"
+          elif echo "$SNIPPET" | grep -qi "Quality Gate"; then
+            FAILURE_TYPE="SONAR_FAILURE"
+          fi
+
+          echo "failure_type=$FAILURE_TYPE" >> "$GITHUB_OUTPUT"
+          echo "${SNIPPET:0:5000}" > "$WORK/error_snippet.txt"
+          echo "$FAILED_JOBS" > "$WORK/failed_jobs.txt"
+
+      # ── 4. MCP Skill Dispatch — select tool AND mode ──
+      - name: MCP Skill Dispatch
+        if: steps.guard.outputs.should_fix == 'true'
+        id: dispatch
+        run: |
+          FAILURE_TYPE="${{ steps.logs.outputs.failure_type }}"
+          ATTEMPT="${{ steps.guard.outputs.attempt }}"
+          PREV_MSG="${{ steps.guard.outputs.prev_autofix_msg }}"
+          WORK="/tmp/autofix"
+
+          # ┌─────────────────────────────────────────────────────┐
+          # │  MCP Tool Registry                                  │
+          # │  Maps failure types → tool + mode (autofix|suggest) │
+          # └─────────────────────────────────────────────────────┘
+
+          cat > "$WORK/mcp_registry.json" << 'REGISTRY'
+          {
+            "tools": {
+              "tdd-bug-fix": {
+                "description": "Fix failing tests via minimal, targeted changes",
+                "modes": ["autofix", "suggest"],
+                "autofix_scope": "test assertion fixes, null checks, return value fixes, missing branches",
+                "suggest_scope": "complex logic changes, multi-method fixes, architectural issues"
+              },
+              "debug-ci": {
+                "description": "Fix CI build/compilation failures",
+                "modes": ["autofix"],
+                "autofix_scope": "missing imports, type mismatches, symbol resolution"
+              },
+              "refactor": {
+                "description": "Fix style-level and low-risk lint violations only",
+                "modes": ["autofix", "suggest"],
+                "autofix_scope": "unused imports, formatting, annotations, try-with-resources",
+                "suggest_scope": "logic-adjacent lint fixes that could alter behavior"
+              },
+              "clarify": {
+                "description": "Analyze failures — strictly no code changes, suggestions only",
+                "modes": ["suggest"],
+                "suggest_scope": "root cause analysis, logic improvement suggestions"
+              }
+            }
+          }
+          REGISTRY
+
+          # ┌─────────────────────────────────────────────────────┐
+          # │  Decision Engine — selects tool AND mode            │
+          # │  autofix = safe, applied automatically              │
+          # │  suggest = complex, shown as PR comment only        │
+          # └─────────────────────────────────────────────────────┘
+
+          SELECTED_TOOL=""
+          MODE="autofix"
+          REASON=""
+
+          case "$FAILURE_TYPE" in
+            TEST_FAILURE)
+              SELECTED_TOOL="tdd-bug-fix"
+              MODE="autofix"
+              REASON="Test failure detected. Auto-fix mode: will attempt minimal, safe fix to test or production code."
+              ;;
+            COVERAGE_FAILURE)
+              SELECTED_TOOL="tdd-bug-fix"
+              MODE="autofix"
+              REASON="Coverage below 60% threshold. Auto-fix mode: will add targeted test methods for uncovered branches."
+              ;;
+            LINT_FAILURE)
+              SELECTED_TOOL="refactor"
+              MODE="autofix"
+              REASON="Static analysis violation. Auto-fix mode: style-level fix only (no logic changes)."
+              ;;
+            BUILD_ERROR)
+              SELECTED_TOOL="debug-ci"
+              MODE="autofix"
+              REASON="Compilation error. Auto-fix mode: fix missing imports, type mismatches, or symbol errors."
+              ;;
+            SONAR_FAILURE)
+              SELECTED_TOOL="clarify"
+              MODE="suggest"
+              REASON="SonarQube quality gate failure. Suggest mode: will analyze and suggest improvements for developer review."
+              ;;
+            UNKNOWN)
+              SELECTED_TOOL="clarify"
+              MODE="suggest"
+              REASON="Unclassified failure. Suggest mode: will analyze root cause and suggest next steps."
+              ;;
+          esac
+
+          # Repeated-error escalation: same failure type after previous fix → switch to suggest
+          if [ -n "$PREV_MSG" ] && echo "$PREV_MSG" | grep -q "$FAILURE_TYPE"; then
+            echo "::warning::Same failure type ($FAILURE_TYPE) after previous autofix. Escalating to suggest mode."
+            MODE="suggest"
+            if [ "$SELECTED_TOOL" != "clarify" ]; then
+              REASON="Repeated $FAILURE_TYPE after attempt #$((ATTEMPT - 1)). Switching to suggest mode — previous auto-fix did not resolve the issue. Will provide suggested code changes for developer review."
+            else
+              REASON="Repeated unclassified failure. Providing analysis and suggestions only."
+            fi
+          fi
+
+          echo "──────────────────────────────────────"
+          echo "MCP Skill Dispatch Decision:"
+          echo "  Failure Type : $FAILURE_TYPE"
+          echo "  Selected Tool: $SELECTED_TOOL"
+          echo "  Mode         : $MODE"
+          echo "  Reason       : $REASON"
+          echo "──────────────────────────────────────"
+
+          echo "selected_tool=$SELECTED_TOOL" >> "$GITHUB_OUTPUT"
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "reason=$REASON" >> "$GITHUB_OUTPUT"
+
+          cat > "$WORK/dispatch_log.json" << EOF
+          {
+            "failure_type": "$FAILURE_TYPE",
+            "selected_tool": "$SELECTED_TOOL",
+            "mode": "$MODE",
+            "reason": "$REASON",
+            "attempt": $ATTEMPT
+          }
+          EOF
+
+      # ── 5a. AUTO-FIX mode — generate and apply safe fixes ──
+      - name: "MCP Tool: ${{ steps.dispatch.outputs.selected_tool }} [autofix]"
+        if: steps.guard.outputs.should_fix == 'true' && steps.dispatch.outputs.mode == 'autofix'
+        id: fix
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          WORK="/tmp/autofix"
+          FAILURE_TYPE="${{ steps.logs.outputs.failure_type }}"
+          SELECTED_TOOL="${{ steps.dispatch.outputs.selected_tool }}"
+          ERROR_SNIPPET=$(cat "$WORK/error_snippet.txt")
+
+          # ── Gather affected source files ──
+          AFFECTED_FILES=$(grep -oP '(srv|integration-tests)/src/[^\s:]+\.java' "$WORK/error_snippet.txt" 2>/dev/null | sort -u | head -5 || true)
+
+          FAILING_TEST=$(grep -oP '(?:<<< FAIL! - in )\K\S+' "$WORK/error_snippet.txt" 2>/dev/null | head -1 || true)
+          if [ -n "$FAILING_TEST" ]; then
+            TEST_PATH="srv/src/test/java/$(echo "$FAILING_TEST" | tr '.' '/').java"
+            if [ -f "$TEST_PATH" ]; then
+              AFFECTED_FILES="$AFFECTED_FILES $TEST_PATH"
+              IMPL_PATH=$(echo "$TEST_PATH" | sed 's|/test/|/main/|; s|Test\.java$|.java|')
+              [ -f "$IMPL_PATH" ] && AFFECTED_FILES="$AFFECTED_FILES $IMPL_PATH"
+            fi
+          fi
+
+          SOURCE_CONTEXT=""
+          for f in $AFFECTED_FILES; do
+            [ -f "$f" ] && SOURCE_CONTEXT="${SOURCE_CONTEXT}
+          ### $f
+          \`\`\`java
+          $(cat "$f")
+          \`\`\`
+          "
+          done
+
+          # ── Tool-specific system prompts (autofix mode) ──
+          case "$SELECTED_TOOL" in
+            tdd-bug-fix)
+              SYSTEM_PROMPT='You are an MCP tool: tdd-bug-fix (autofix mode — safe, minimal changes only).
+          Capability: Fix failing tests via minimal, targeted changes.
+          Strategy:
+          1. Read the test assertion and the actual vs expected values.
+          2. Determine if the test expectation is outdated or the implementation has a bug.
+          3. Prefer fixing the test when the implementation behavior is intentionally changed.
+          4. If the implementation has a clear defect (null pointer, wrong return value, missing branch),
+             fix the production code — but keep the change minimal and safe:
+             - OK: add a null check, fix a return value, add a missing enum case, fix an off-by-one
+             - NOT OK: rewrite a method, change architecture, alter public API contracts, add new classes
+          5. For coverage failures: add minimal new test methods covering uncovered branches.
+          IMPORTANT: If the fix requires significant logic changes (method rewrites, new algorithms,
+          complex conditional restructuring), do NOT attempt it. Return {"files": [], "reason": "..."} instead.
+          The system will automatically escalate to suggestion mode.
+          Constraints:
+          - Only modify .java files under srv/src/ or integration-tests/src/.
+          - No new dependencies, no pom.xml changes.
+          - Follow existing patterns: JUnit 5, @ExtendWith(SpringExtension.class), @Mock, @InjectMocks.
+          Output: ONLY valid JSON: {"files": [{"path": "relative/path.java", "content": "...complete file..."}]}
+          If too complex: {"files": [], "reason": "why this needs developer review"}'
+              ;;
+            debug-ci)
+              SYSTEM_PROMPT='You are an MCP tool: debug-ci (autofix mode).
+          Capability: Fix CI build/compilation failures.
+          Strategy:
+          1. Parse the compilation error (missing symbol, type mismatch, missing import).
+          2. Fix only the immediate compilation error.
+          3. Add missing imports if needed.
+          4. Do NOT refactor surrounding code.
+          Constraints:
+          - Only modify .java files under srv/src/ or integration-tests/src/.
+          - No new dependencies, no pom.xml changes.
+          - Fix the minimum needed to compile. No cleanup, no improvements.
+          Output: ONLY valid JSON: {"files": [{"path": "relative/path.java", "content": "...complete file..."}]}
+          If unfixable: {"files": [], "reason": "why"}'
+              ;;
+            refactor)
+              SYSTEM_PROMPT='You are an MCP tool: refactor (autofix mode — style-level only).
+          Capability: Fix static analysis and lint violations with ZERO logic changes.
+          Allowed changes (safe, style-level):
+          - Remove unused imports, fix formatting, add @Override/@SuppressWarnings
+          - Close resources (try-with-resources), add null-check annotations
+          - Rename local variables to match conventions
+          Forbidden changes (escalate to suggest mode instead):
+          - Changing method signatures, return types, control flow, exception handling
+          - Modifying public APIs, adding methods/classes, changing business logic
+          Constraints:
+          - Only modify .java files under srv/src/ or integration-tests/src/.
+          - No new dependencies. One violation = one minimal fix.
+          - If the fix would require logic changes, return {"files": [], "reason": "..."} instead.
+          Output: ONLY valid JSON: {"files": [{"path": "relative/path.java", "content": "...complete file..."}]}
+          If too risky: {"files": [], "reason": "why this needs developer review"}'
+              ;;
+          esac
+
+          USER_PROMPT="## MCP Tool Invocation: $SELECTED_TOOL [autofix mode]
+          **Failure Type**: $FAILURE_TYPE
+          **Project**: SAP CAP Java 21 + Spring Boot (package: com.sap.crun.iep)
+
+          ## Error Log
+          \`\`\`
+          $ERROR_SNIPPET
+          \`\`\`
+
+          ## Source Files
+          $SOURCE_CONTEXT"
+
+          RESPONSE=$(curl -s "https://api.anthropic.com/v1/messages" \
+            -H "content-type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -d "$(jq -n \
+              --arg system "$SYSTEM_PROMPT" \
+              --arg prompt "$USER_PROMPT" \
+              '{
+                model: "claude-sonnet-4-20250514",
+                max_tokens: 8192,
+                system: $system,
+                messages: [{role: "user", content: $prompt}]
+              }')")
+
+          RAW=$(echo "$RESPONSE" | jq -r '.content[0].text // empty')
+          if [ -z "$RAW" ]; then
+            echo "::error::Empty API response from $SELECTED_TOOL"
+            echo "has_fix=false" >> "$GITHUB_OUTPUT"
+            echo "needs_suggestion=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CLEAN=$(echo "$RAW" | sed '/^```[a-z]*$/d; /^```$/d')
+          echo "$CLEAN" > "$WORK/fix.json"
+
+          FILE_COUNT=$(jq '.files | length' "$WORK/fix.json" 2>/dev/null || echo 0)
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            REASON=$(jq -r '.reason // "No fix generated"' "$WORK/fix.json" 2>/dev/null || echo "Parse error")
+            echo "::warning::$SELECTED_TOOL returned no fix: $REASON"
+            echo "$REASON" > "$WORK/no_fix_reason.txt"
+            echo "has_fix=false" >> "$GITHUB_OUTPUT"
+            # Signal that we should fall back to suggestion mode
+            echo "needs_suggestion=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "$SELECTED_TOOL generated fixes for $FILE_COUNT file(s)"
+          echo "has_fix=true" >> "$GITHUB_OUTPUT"
+          echo "needs_suggestion=false" >> "$GITHUB_OUTPUT"
+          echo "file_count=$FILE_COUNT" >> "$GITHUB_OUTPUT"
+
+      # ── 5b. SUGGEST mode — analyze and suggest (no code changes) ──
+      - name: "MCP Tool: ${{ steps.dispatch.outputs.selected_tool }} [suggest]"
+        if: >
+          steps.guard.outputs.should_fix == 'true' &&
+          (steps.dispatch.outputs.mode == 'suggest' || steps.fix.outputs.needs_suggestion == 'true')
+        id: suggest
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          WORK="/tmp/autofix"
+          ERROR_SNIPPET=$(cat "$WORK/error_snippet.txt")
+          FAILURE_TYPE="${{ steps.logs.outputs.failure_type }}"
+          SELECTED_TOOL="${{ steps.dispatch.outputs.selected_tool }}"
+          NO_FIX_REASON=$(cat "$WORK/no_fix_reason.txt" 2>/dev/null || echo "")
+
+          # ── Gather source context (same as autofix) ──
+          AFFECTED_FILES=$(grep -oP '(srv|integration-tests)/src/[^\s:]+\.java' "$WORK/error_snippet.txt" 2>/dev/null | sort -u | head -5 || true)
+          FAILING_TEST=$(grep -oP '(?:<<< FAIL! - in )\K\S+' "$WORK/error_snippet.txt" 2>/dev/null | head -1 || true)
+          if [ -n "$FAILING_TEST" ]; then
+            TEST_PATH="srv/src/test/java/$(echo "$FAILING_TEST" | tr '.' '/').java"
+            if [ -f "$TEST_PATH" ]; then
+              AFFECTED_FILES="$AFFECTED_FILES $TEST_PATH"
+              IMPL_PATH=$(echo "$TEST_PATH" | sed 's|/test/|/main/|; s|Test\.java$|.java|')
+              [ -f "$IMPL_PATH" ] && AFFECTED_FILES="$AFFECTED_FILES $IMPL_PATH"
+            fi
+          fi
+          SOURCE_CONTEXT=""
+          for f in $AFFECTED_FILES; do
+            [ -f "$f" ] && SOURCE_CONTEXT="${SOURCE_CONTEXT}
+          ### $f
+          \`\`\`java
+          $(cat "$f")
+          \`\`\`
+          "
+          done
+
+          # ── Suggest-mode system prompt ──
+          SYSTEM_PROMPT='You are an MCP tool operating in SUGGEST mode. You do NOT produce code patches.
+          Instead, you provide a developer-friendly analysis with actionable suggestions.
+
+          Your response must be valid JSON with this exact structure:
+          {
+            "root_cause": "One-sentence summary of what went wrong",
+            "analysis": "2-4 bullet points explaining the failure in detail",
+            "suggestions": [
+              {
+                "file": "relative/path/to/File.java",
+                "description": "What to change and why",
+                "snippet": "```java\n// suggested code change\n```",
+                "risk": "low|medium|high",
+                "reasoning": "Why this change is needed"
+              }
+            ]
+          }
+
+          Rules:
+          - Be specific: name the exact file, method, and line where the issue is.
+          - Each suggestion should be a focused, self-contained change.
+          - The "snippet" shows the SUGGESTED new code (not the full file), with enough context to locate it.
+          - Rate risk: low = safe rename/null-check, medium = logic change in one method, high = multi-method or API change.
+          - If this was escalated from autofix mode, explain WHY the auto-fix could not handle it.
+          - Return valid JSON only. No markdown outside JSON.'
+
+          ESCALATION_CONTEXT=""
+          if [ -n "$NO_FIX_REASON" ]; then
+            ESCALATION_CONTEXT="
+          ## Escalation from Auto-Fix
+          The auto-fix tool could not resolve this automatically.
+          Reason: $NO_FIX_REASON
+          Please explain why and provide suggested changes for the developer."
+          fi
+
+          USER_PROMPT="## MCP Tool Invocation: $SELECTED_TOOL [suggest mode]
+          **Failure Type**: $FAILURE_TYPE
+          **Project**: SAP CAP Java 21 + Spring Boot (package: com.sap.crun.iep)
+          $ESCALATION_CONTEXT
+
+          ## Error Log
+          \`\`\`
+          $ERROR_SNIPPET
+          \`\`\`
+
+          ## Source Files
+          $SOURCE_CONTEXT"
+
+          RESPONSE=$(curl -s "https://api.anthropic.com/v1/messages" \
+            -H "content-type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -d "$(jq -n \
+              --arg system "$SYSTEM_PROMPT" \
+              --arg prompt "$USER_PROMPT" \
+              '{
+                model: "claude-sonnet-4-20250514",
+                max_tokens: 4096,
+                system: $system,
+                messages: [{role: "user", content: $prompt}]
+              }')")
+
+          RAW=$(echo "$RESPONSE" | jq -r '.content[0].text // empty')
+          if [ -z "$RAW" ]; then
+            echo "::warning::Empty suggestion response"
+            echo '{"root_cause":"Analysis unavailable","analysis":"API returned empty response","suggestions":[]}' > "$WORK/suggestion.json"
+            echo "has_suggestion=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CLEAN=$(echo "$RAW" | sed '/^```[a-z]*$/d; /^```$/d')
+          echo "$CLEAN" > "$WORK/suggestion.json"
+
+          # Validate JSON
+          if ! jq '.' "$WORK/suggestion.json" > /dev/null 2>&1; then
+            # If not valid JSON, save raw text as analysis
+            echo "{\"root_cause\":\"See analysis below\",\"analysis\":$(echo "$CLEAN" | jq -Rs .),\"suggestions\":[]}" > "$WORK/suggestion.json"
+          fi
+
+          SUGGESTION_COUNT=$(jq '.suggestions | length' "$WORK/suggestion.json" 2>/dev/null || echo 0)
+          echo "Generated $SUGGESTION_COUNT suggestion(s)"
+          echo "has_suggestion=true" >> "$GITHUB_OUTPUT"
+          echo "suggestion_count=$SUGGESTION_COUNT" >> "$GITHUB_OUTPUT"
+
+      # ── 6. Apply fix, commit, push (autofix mode only) ──
+      - name: Apply fix and push
+        if: steps.fix.outputs.has_fix == 'true' && inputs.dry_run != true
+        id: apply
+        run: |
+          WORK="/tmp/autofix"
+          ATTEMPT="${{ steps.guard.outputs.attempt }}"
+          FAILURE_TYPE="${{ steps.logs.outputs.failure_type }}"
+          SELECTED_TOOL="${{ steps.dispatch.outputs.selected_tool }}"
+          FILE_COUNT="${{ steps.fix.outputs.file_count }}"
+          APPLIED=0
+          APPLIED_LIST=""
+
+          for i in $(seq 0 $((FILE_COUNT - 1))); do
+            FILE_PATH=$(jq -r ".files[$i].path" "$WORK/fix.json")
+            FILE_CONTENT=$(jq -r ".files[$i].content" "$WORK/fix.json")
+
+            # Safety guards
+            if [ ! -f "$FILE_PATH" ]; then
+              echo "SKIP $FILE_PATH (does not exist)"
+              continue
+            fi
+            if [[ ! "$FILE_PATH" == *.java ]]; then
+              echo "SKIP $FILE_PATH (not .java)"
+              continue
+            fi
+            if [[ ! "$FILE_PATH" == srv/src/* ]] && [[ ! "$FILE_PATH" == integration-tests/src/* ]]; then
+              echo "SKIP $FILE_PATH (not in allowed path)"
+              continue
+            fi
+
+            echo "$FILE_CONTENT" > "$FILE_PATH"
+            git add "$FILE_PATH"
+            APPLIED=$((APPLIED + 1))
+            APPLIED_LIST="$APPLIED_LIST $FILE_PATH"
+            echo "APPLIED $FILE_PATH"
+          done
+
+          if [ "$APPLIED" -eq 0 ] || git diff --cached --quiet; then
+            echo "No changes to commit"
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          SHORT_LIST=$(echo "$APPLIED_LIST" | tr ' ' '\n' | sed '/^$/d' | sed 's|.*/||' | tr '\n' ', ' | sed 's/,$//')
+          git -c user.name="autofix-bot" -c user.email="autofix-bot@github.tools.sap" \
+            commit -m "$(cat <<EOF
+          [autofix] Attempt #${ATTEMPT}: Fix ${FAILURE_TYPE} via ${SELECTED_TOOL} in ${SHORT_LIST}
+
+          MCP Tool: ${SELECTED_TOOL} [autofix mode]
+          Automated fix by PR self-healing pipeline.
+          EOF
+          )"
+          git push
+          echo "committed=true" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # ── 7. PR Comment — distinguish applied fixes vs suggestions ──
+      - name: Comment on PR
+        if: always() && steps.guard.outputs.should_fix == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.AUTOFIX_GITHUB_TOKEN }}
+        run: |
+          PR="${{ steps.guard.outputs.pr_number }}"
+          ATTEMPT="${{ steps.guard.outputs.attempt }}"
+          TYPE="${{ steps.logs.outputs.failure_type }}"
+          TOOL="${{ steps.dispatch.outputs.selected_tool }}"
+          MODE="${{ steps.dispatch.outputs.mode }}"
+          DISPATCH_REASON="${{ steps.dispatch.outputs.reason }}"
+          HAS_FIX="${{ steps.fix.outputs.has_fix }}"
+          COMMITTED="${{ steps.apply.outputs.committed }}"
+          SHA="${{ steps.apply.outputs.commit_sha }}"
+          HAS_SUGGESTION="${{ steps.suggest.outputs.has_suggestion }}"
+          WORK="/tmp/autofix"
+
+          # ── Build applied-fix section ──
+          APPLIED_SECTION=""
+          if [ "$COMMITTED" = "true" ]; then
+            APPLIED_SECTION="### ✅ Applied Fix (auto-fix mode)
+          | | |
+          |---|---|
+          | **Tool** | \`$TOOL\` |
+          | **Commit** | \`$SHA\` |
+          | **Action** | Fix committed and pushed. Pipeline will re-run automatically. |
+          "
+          elif [ "$MODE" = "autofix" ] && [ "$HAS_FIX" != "true" ]; then
+            NO_FIX_REASON=$(cat "$WORK/no_fix_reason.txt" 2>/dev/null || echo "Unknown")
+            APPLIED_SECTION="### ⚠️ Auto-Fix Attempted
+          The \`$TOOL\` tool could not produce a safe fix automatically.
+          **Reason**: $NO_FIX_REASON
+          Escalated to suggestion mode below.
+          "
+          fi
+
+          # ── Build suggestion section ──
+          SUGGESTION_SECTION=""
+          if [ "$HAS_SUGGESTION" = "true" ] && [ -f "$WORK/suggestion.json" ]; then
+            ROOT_CAUSE=$(jq -r '.root_cause // "Unknown"' "$WORK/suggestion.json" 2>/dev/null)
+            ANALYSIS=$(jq -r '.analysis // "No analysis available"' "$WORK/suggestion.json" 2>/dev/null)
+            SUGGESTION_COUNT=$(jq '.suggestions | length' "$WORK/suggestion.json" 2>/dev/null || echo 0)
+
+            SUGGESTION_SECTION="### 💡 Suggested Improvements (requires developer approval)
+
+          **Root Cause**: $ROOT_CAUSE
+
+          **Analysis**:
+          $ANALYSIS
+          "
+
+            if [ "$SUGGESTION_COUNT" -gt 0 ]; then
+              SUGGESTION_SECTION="${SUGGESTION_SECTION}
+          **Suggestions** ($SUGGESTION_COUNT):
+          "
+              for i in $(seq 0 $((SUGGESTION_COUNT - 1))); do
+                S_FILE=$(jq -r ".suggestions[$i].file // \"—\"" "$WORK/suggestion.json")
+                S_DESC=$(jq -r ".suggestions[$i].description // \"\"" "$WORK/suggestion.json")
+                S_SNIPPET=$(jq -r ".suggestions[$i].snippet // \"\"" "$WORK/suggestion.json")
+                S_RISK=$(jq -r ".suggestions[$i].risk // \"unknown\"" "$WORK/suggestion.json")
+                S_REASONING=$(jq -r ".suggestions[$i].reasoning // \"\"" "$WORK/suggestion.json")
+
+                RISK_BADGE="🟢"
+                [ "$S_RISK" = "medium" ] && RISK_BADGE="🟡"
+                [ "$S_RISK" = "high" ] && RISK_BADGE="🔴"
+
+                SUGGESTION_SECTION="${SUGGESTION_SECTION}
+          <details><summary>${RISK_BADGE} <b>[$S_RISK risk]</b> <code>$S_FILE</code> — $S_DESC</summary>
+
+          **Reasoning**: $S_REASONING
+
+          $S_SNIPPET
+
+          </details>
+          "
+              done
+            fi
+          fi
+
+          # ── Build final comment ──
+          MODE_LABEL="autofix"
+          [ "$MODE" = "suggest" ] && MODE_LABEL="suggest"
+          [ "$HAS_FIX" != "true" ] && [ "$HAS_SUGGESTION" = "true" ] && MODE_LABEL="suggest (escalated)"
+
+          BODY="<!-- autofix-bot -->
+          ## 🤖 PR Auto-Fix — Attempt #${ATTEMPT}/${{ env.MAX_RETRIES }}
+
+          | | |
+          |---|---|
+          | **Failure** | \`$TYPE\` |
+          | **MCP Tool** | \`$TOOL\` |
+          | **Mode** | \`$MODE_LABEL\` |
+          | **Dispatch Reason** | $DISPATCH_REASON |
+
+          ---
+
+          $APPLIED_SECTION
+          $SUGGESTION_SECTION
+
+          <details><summary>Error snippet</summary>
+
+          \`\`\`
+          $(head -50 "$WORK/error_snippet.txt" 2>/dev/null || echo 'N/A')
+          \`\`\`
+          </details>
+
+          ---
+          *Modes: ✅ \`autofix\` = applied automatically · 💡 \`suggest\` = requires developer approval*
+          *Tools: \`tdd-bug-fix\` · \`debug-ci\` · \`refactor\` · \`clarify\` — Add \`no-autofix\` label to disable.*"
+
+          gh api "repos/${{ github.repository }}/issues/${PR}/comments" \
+            -f body="$BODY" > /dev/null 2>&1 || echo "::warning::Failed to post comment"
