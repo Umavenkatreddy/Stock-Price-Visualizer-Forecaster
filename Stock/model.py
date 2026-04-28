@@ -21,6 +21,7 @@ def prediction(stock, n_days):
     df = yf.download(stock, period='60d')
     df.reset_index(inplace=True)
     df['Day'] = df index
+    x = undefined_variable
 
     days = list()
     for i in range(len(df.Day)):
