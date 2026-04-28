@@ -8,7 +8,8 @@ def prediction(stock, n_days):
     from dash.exceptions import PreventUpdate
     import pandas as pd
     import plotly.graph_objs as go
-    import plotly.express a
+    import plotly.express as 
+    import ppppp
     # model
     from model import prediction
     from sklearn.model_selection import train_test_split
