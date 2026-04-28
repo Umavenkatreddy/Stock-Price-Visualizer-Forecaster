@@ -1,0 +1,77 @@
+name: Universal CI Pipeline
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # Detect project type
+      - name: Detect Project Type
+        id: detect
+        run: |
+          if [ -f "pom.xml" ]; then
+            echo "type=java-maven" >> $GITHUB_OUTPUT
+          elif [ -f "build.gradle" ] || [ -f "gradlew" ]; then
+            echo "type=java-gradle" >> $GITHUB_OUTPUT
+          elif [ -f "requirements.txt" ] || ls *.py 1> /dev/null 2>&1; then
+            echo "type=python" >> $GITHUB_OUTPUT
+          else
+            echo "type=unknown" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Print detected type
+        run: echo "Detected project type: ${{ steps.detect.outputs.type }}"
+
+      # ------------------ PYTHON ------------------
+      - name: Setup Python
+        if: steps.detect.outputs.type == 'python'
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install Python Dependencies (optional)
+        if: steps.detect.outputs.type == 'python'
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            echo "No requirements.txt found, skipping install"
+          fi
+
+      - name: Run Python Checks
+        if: steps.detect.outputs.type == 'python'
+        run: |
+          find . -name "*.py" -exec python -m py_compile {} \;
+
+      # ------------------ JAVA ------------------
+      - name: Setup Java
+        if: steps.detect.outputs.type == 'java-maven' || steps.detect.outputs.type == 'java-gradle'
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Build with Maven
+        if: steps.detect.outputs.type == 'java-maven'
+        run: mvn -B clean install
+
+      - name: Build with Gradle
+        if: steps.detect.outputs.type == 'java-gradle'
+        run: |
+          chmod +x gradlew
+          ./gradlew build
+
+      # ------------------ UNKNOWN ------------------
+      - name: Fail if Unknown Project
+        if: steps.detect.outputs.type == 'unknown'
+        run: |
+          echo "Unsupported project type"
+          exit 1
