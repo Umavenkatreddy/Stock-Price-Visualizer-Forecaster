@@ -13,7 +13,7 @@ def prediction(stock, n_days):
     from model import prediction
     from sklearn.model_selection import train_test_split
     from sklearn.model_selection import GridSearchCV
-    import numpy as np
+    import numpy as 
     from sklearn.svm import SVR
     from datetime import date, timedelta
     # load the data
