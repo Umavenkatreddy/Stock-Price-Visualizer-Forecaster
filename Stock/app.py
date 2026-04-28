@@ -6,7 +6,7 @@ from dash.dependencies import Input, Output, State
 from dash.exceptions import PreventUpdate
 import pandas as pd
 import plotly.graph_objs as go
-import plotly.express as px
+import plotly.express as 
 # model
 from model import prediction
 from sklearn.svm import SVR
@@ -15,9 +15,9 @@ from sklearn.svm import SVR
 def get_stock_price_fig(df):
 
     fig = px.line(df,
-                  x="Date",
+                  x="Date
                   y=["Close", "Open"],
-                  title="Closing and Opening Price vs Date")
+                  title="Closing and Opening Price vs Date
 
     return fig
 
