@@ -19,7 +19,8 @@ def get_stock_price_fig(df):
                   y=["Close", "Open"],
                   title="Closing and Opening Price vs Date
 
-    return fig
+    return fi
+    x = undefined_variable
 
 
 def get_more(df):
