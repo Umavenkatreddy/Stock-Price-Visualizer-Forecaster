@@ -1,0 +1,727 @@
+# =============================================================================
+# Stock Price Visualizer & Forecaster — CI/CD Pipeline
+#
+# Stages (sequential):
+#   init → build → integration → acceptance → performance → promote → release → post
+#
+# Trigger matrix:
+#   • PR to main          → all stages run (promote/release gate on merge)
+#   • Push to main        → all stages run (promote + release execute)
+#   • Push to feature/**  → init + build + integration only
+# =============================================================================
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - "feature/**"
+  pull_request:
+    branches:
+      - main
+
+# Cancel in-flight runs for the same branch/PR when a new push arrives.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared env-level defaults
+# ─────────────────────────────────────────────────────────────────────────────
+env:
+  PYTHON_VERSION: "3.11"
+  ARTIFACT_NAME: stock-wheel
+  COVERAGE_THRESHOLD: 70
+
+# =============================================================================
+# STAGE 1 — INIT
+# =============================================================================
+jobs:
+  init:
+    name: "Stage 1 · Init"
+    runs-on: ubuntu-latest
+    outputs:
+      branch:      ${{ steps.meta.outputs.branch }}
+      is_main:     ${{ steps.meta.outputs.is_main }}
+      short_sha:   ${{ steps.meta.outputs.short_sha }}
+      run_version: ${{ steps.meta.outputs.run_version }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history needed for release notes
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      # ---- Parse & validate environment metadata ---------------------------
+      - name: Collect pipeline metadata
+        id: meta
+        run: |
+          BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          IS_MAIN="false"
+          if [[ "$BRANCH" == "main" || "$BRANCH" == "master" ]]; then
+            IS_MAIN="true"
+          fi
+          SHORT_SHA="${GITHUB_SHA::8}"
+          RUN_VERSION="v1.0.${{ github.run_number }}"
+
+          echo "branch=$BRANCH"             >> "$GITHUB_OUTPUT"
+          echo "is_main=$IS_MAIN"           >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA"       >> "$GITHUB_OUTPUT"
+          echo "run_version=$RUN_VERSION"   >> "$GITHUB_OUTPUT"
+
+      # ---- Print pipeline banner -------------------------------------------
+      - name: Print pipeline metadata
+        run: |
+          echo "╔══════════════════════════════════════════════╗"
+          echo "║   Stock Price Visualizer & Forecaster CI/CD ║"
+          echo "╚══════════════════════════════════════════════╝"
+          echo ""
+          echo "  Repository : ${{ github.repository }}"
+          echo "  Branch     : ${{ steps.meta.outputs.branch }}"
+          echo "  Commit SHA : ${{ github.sha }}"
+          echo "  Short SHA  : ${{ steps.meta.outputs.short_sha }}"
+          echo "  Actor      : ${{ github.actor }}"
+          echo "  Run #      : ${{ github.run_number }}"
+          echo "  Version    : ${{ steps.meta.outputs.run_version }}"
+          echo "  Is Main    : ${{ steps.meta.outputs.is_main }}"
+          echo "  Triggered  : ${{ github.event_name }}"
+          echo ""
+
+      # ---- Validate critical files exist -----------------------------------
+      - name: Validate pipeline configuration files
+        run: |
+          echo "Checking required project files..."
+          for f in requirements.txt setup.py setup.cfg locustfile.py; do
+            if [[ -f "$f" ]]; then
+              echo "  ✓  $f"
+            else
+              echo "  ✗  $f  — MISSING"
+              exit 1
+            fi
+          done
+          echo "All configuration files present."
+
+# =============================================================================
+# STAGE 2 — BUILD
+# =============================================================================
+  build:
+    name: "Stage 2 · Build"
+    runs-on: ubuntu-latest
+    needs: init
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      # ---- Install dependencies --------------------------------------------
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ---- Dependency integrity check -------------------------------------
+      - name: pip check (dependency integrity)
+        run: pip check
+
+      # ---- Linting ---------------------------------------------------------
+      - name: Lint with flake8
+        run: |
+          # Treat all errors as failures; use a max line length of 120.
+          flake8 Stock/ \
+            --max-line-length=120 \
+            --extend-ignore=E501,W503 \
+            --statistics \
+            --count
+
+      # ---- Security scan ---------------------------------------------------
+      - name: Security scan with bandit
+        run: |
+          bandit -r Stock/ \
+            --severity-level medium \
+            --confidence-level medium \
+            -f txt \
+            -o bandit-report.txt || true
+          cat bandit-report.txt
+          # Fail on HIGH severity findings only
+          bandit -r Stock/ \
+            --severity-level high \
+            --confidence-level high
+
+      - name: Upload bandit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-security-report
+          path: bandit-report.txt
+          retention-days: 14
+
+      # ---- Build wheel artifact -------------------------------------------
+      - name: Build wheel
+        run: |
+          pip install --upgrade build wheel setuptools
+          python -m build --wheel --outdir dist/
+          echo "Built artifacts:"
+          ls -lh dist/
+
+      # ---- Upload wheel for downstream stages -----------------------------
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist/*.whl
+          retention-days: 7
+
+# =============================================================================
+# STAGE 3 — INTEGRATION  (unit tests + coverage)
+# =============================================================================
+  integration:
+    name: "Stage 3 · Integration"
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ---- Download the built wheel (verifies artifact integrity) ----------
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist/
+
+      - name: Install wheel into test environment
+        run: pip install dist/*.whl --force-reinstall
+
+      # ---- Run tests with coverage ----------------------------------------
+      - name: Run tests with pytest + coverage
+        run: |
+          pytest tests/ \
+            --cov=Stock \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing \
+            --junitxml=junit-report.xml \
+            -v
+
+      # ---- Enforce coverage threshold -------------------------------------
+      - name: Enforce coverage threshold (${{ env.COVERAGE_THRESHOLD }}%)
+        run: |
+          python - <<'EOF'
+          import xml.etree.ElementTree as ET, sys
+          tree = ET.parse("coverage.xml")
+          root = tree.getroot()
+          pct = float(root.attrib.get("line-rate", 0)) * 100
+          threshold = int("${{ env.COVERAGE_THRESHOLD }}")
+          print(f"Coverage: {pct:.2f}%  (threshold: {threshold}%)")
+          if pct < threshold:
+              print(f"FAIL: coverage {pct:.2f}% is below the {threshold}% threshold.")
+              sys.exit(1)
+          print("PASS: coverage threshold met.")
+          EOF
+
+      # ---- Upload reports -------------------------------------------------
+      - name: Upload JUnit test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-test-report
+          path: junit-report.xml
+          retention-days: 14
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 14
+
+# =============================================================================
+# STAGE 4 — ACCEPTANCE  (smoke / end-to-end tests)
+# Skip on feature branches — runs only on PR-to-main and main pushes.
+# =============================================================================
+  acceptance:
+    name: "Stage 4 · Acceptance"
+    runs-on: ubuntu-latest
+    needs: integration
+    # Skip for plain feature-branch pushes (not PRs)
+    if: |
+      github.event_name == 'pull_request' ||
+      github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt requests
+
+      # ---- Start the Dash server in the background ------------------------
+      - name: Start application server
+        run: |
+          cd Stock
+          gunicorn app:server \
+            --bind 0.0.0.0:8050 \
+            --workers 1 \
+            --timeout 60 \
+            --daemon \
+            --log-file ../gunicorn.log
+          echo "Waiting for server to become ready..."
+          for i in $(seq 1 15); do
+            if curl -sf http://localhost:8050/ > /dev/null 2>&1; then
+              echo "Server is up (attempt $i)."
+              break
+            fi
+            sleep 2
+          done
+
+      # ---- Smoke tests ----------------------------------------------------
+      - name: Smoke test — homepage responds 200
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8050/)
+          echo "HTTP status: $STATUS"
+          [[ "$STATUS" == "200" ]] || { echo "FAIL: expected 200, got $STATUS"; exit 1; }
+
+      - name: Smoke test — Dash layout endpoint
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8050/_dash-layout)
+          echo "/_dash-layout HTTP status: $STATUS"
+          [[ "$STATUS" == "200" ]] || { echo "FAIL: expected 200, got $STATUS"; exit 1; }
+
+      - name: Smoke test — Dash dependencies endpoint
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8050/_dash-dependencies)
+          echo "/_dash-dependencies HTTP status: $STATUS"
+          [[ "$STATUS" == "200" ]] || { echo "FAIL: expected 200, got $STATUS"; exit 1; }
+
+      - name: Smoke test — Dash update endpoint reachable
+        run: |
+          # A POST to /_dash-update-component with empty JSON should return
+          # 400 (bad request) not 404/500 — proves the callback router works.
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST http://localhost:8050/_dash-update-component \
+            -H "Content-Type: application/json" \
+            -d '{}')
+          echo "/_dash-update-component HTTP status: $STATUS"
+          [[ "$STATUS" != "404" && "$STATUS" != "500" ]] || \
+            { echo "FAIL: route not registered (got $STATUS)"; exit 1; }
+
+      # ---- Upload server log ----------------------------------------------
+      - name: Upload gunicorn log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gunicorn-acceptance-log
+          path: gunicorn.log
+          retention-days: 7
+
+# =============================================================================
+# STAGE 5 — PERFORMANCE  (locust load test)
+# =============================================================================
+  performance:
+    name: "Stage 5 · Performance"
+    runs-on: ubuntu-latest
+    needs: acceptance
+    if: |
+      github.event_name == 'pull_request' ||
+      github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ---- Start app -------------------------------------------------------
+      - name: Start application server
+        run: |
+          cd Stock
+          gunicorn app:server \
+            --bind 0.0.0.0:8050 \
+            --workers 2 \
+            --timeout 60 \
+            --daemon \
+            --log-file ../gunicorn-perf.log
+          for i in $(seq 1 15); do
+            if curl -sf http://localhost:8050/ > /dev/null 2>&1; then
+              echo "Server ready (attempt $i)."; break
+            fi
+            sleep 2
+          done
+
+      # ---- Run Locust in headless mode ------------------------------------
+      - name: Run Locust load test
+        run: |
+          locust \
+            -f locustfile.py \
+            --headless \
+            --users 10 \
+            --spawn-rate 2 \
+            --run-time 30s \
+            --host http://localhost:8050 \
+            --csv=locust-results \
+            --html=locust-report.html
+          echo "Locust exit code: $?"
+
+      # ---- Check CSV results for threshold breaches -----------------------
+      - name: Validate performance thresholds
+        run: |
+          python - <<'EOF'
+          import csv, sys
+
+          P95_LIMIT_MS  = 2000
+          FAIL_RATE_MAX = 0.01   # 1 %
+
+          try:
+              with open("locust-results_stats.csv") as f:
+                  rows = list(csv.DictReader(f))
+          except FileNotFoundError:
+              print("No CSV stats file found — skipping threshold check.")
+              sys.exit(0)
+
+          breaches = []
+          for row in rows:
+              name = row.get("Name", "")
+              if name == "Aggregated":
+                  p95 = float(row.get("95%", 0) or 0)
+                  fail_pct = float(row.get("Failure Count", 0) or 0) / \
+                             max(float(row.get("Request Count", 1) or 1), 1)
+
+                  print(f"  p95 response time : {p95:.0f} ms  (limit: {P95_LIMIT_MS} ms)")
+                  print(f"  Failure rate      : {fail_pct*100:.2f}%  (limit: {FAIL_RATE_MAX*100:.0f}%)")
+
+                  if p95 > P95_LIMIT_MS:
+                      breaches.append(f"p95 {p95:.0f} ms > {P95_LIMIT_MS} ms")
+                  if fail_pct > FAIL_RATE_MAX:
+                      breaches.append(f"failure rate {fail_pct*100:.2f}% > {FAIL_RATE_MAX*100:.0f}%")
+
+          if breaches:
+              for b in breaches:
+                  print(f"THRESHOLD BREACH: {b}")
+              sys.exit(1)
+          print("All performance thresholds met.")
+          EOF
+
+      # ---- Upload Locust report -------------------------------------------
+      - name: Upload Locust HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: locust-performance-report
+          path: |
+            locust-report.html
+            locust-results_stats.csv
+            locust-results_failures.csv
+          retention-days: 14
+
+# =============================================================================
+# STAGE 6 — PROMOTE  (tag + GitHub Release)
+# Runs only when all previous stages pass AND we are on the main branch.
+# =============================================================================
+  promote:
+    name: "Stage 6 · Promote"
+    runs-on: ubuntu-latest
+    needs: performance
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: write   # needed to create tags and releases
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # ---- Download wheel -------------------------------------------------
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist/
+
+      # ---- Create & push version tag --------------------------------------
+      - name: Create version tag
+        id: tag
+        run: |
+          VERSION="v1.0.${{ github.run_number }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "Release $VERSION — promoted by CI run #${{ github.run_number }}"
+          git push origin "$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # ---- Generate release notes from commit log -------------------------
+      - name: Generate release notes
+        id: notes
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [[ -n "$PREV_TAG" ]]; then
+            LOG=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s (%h)" --no-merges)
+          else
+            LOG=$(git log --pretty=format:"- %s (%h)" --no-merges -20)
+          fi
+          echo "## What's Changed" > release-notes.md
+          echo "" >> release-notes.md
+          echo "$LOG" >> release-notes.md
+          echo "" >> release-notes.md
+          echo "**Full Changelog:** https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${{ steps.tag.outputs.version }}" >> release-notes.md
+          cat release-notes.md
+
+      # ---- Create GitHub Release with wheel asset -------------------------
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:  ${{ steps.tag.outputs.version }}
+          name:      "Release ${{ steps.tag.outputs.version }}"
+          body_path: release-notes.md
+          files:     dist/*.whl
+          draft:     false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Print promote summary
+        run: |
+          echo "Promoted: ${{ steps.tag.outputs.version }}"
+          echo "Artifacts: $(ls dist/*.whl)"
+
+# =============================================================================
+# STAGE 7 — RELEASE  (publish to PyPI Test)
+# Runs only on main branch pushes, after promote succeeds.
+# =============================================================================
+  release:
+    name: "Stage 7 · Release (PyPI Test)"
+    runs-on: ubuntu-latest
+    needs: promote
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: pypi-test   # optional: require manual approval in repo settings
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Twine
+        run: pip install twine
+
+      # ---- Download the promoted wheel ------------------------------------
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist/
+
+      # ---- Validate package before upload ---------------------------------
+      - name: Validate package with twine check
+        run: twine check dist/*.whl
+
+      # ---- Upload to PyPI Test -------------------------------------------
+      - name: Publish to PyPI Test
+        env:
+          TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
+          TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
+        run: |
+          twine upload \
+            --repository-url https://test.pypi.org/legacy/ \
+            --skip-existing \
+            dist/*.whl
+
+      - name: Print install command
+        run: |
+          VERSION="v1.0.${{ github.run_number }}"
+          PKG="stock-price-visualizer-forecaster"
+          echo "Package published to PyPI Test."
+          echo "Install with:"
+          echo "  pip install --index-url https://test.pypi.org/simple/ ${PKG}"
+
+# =============================================================================
+# STAGE 8 — POST  (always runs — notifications, cleanup)
+# =============================================================================
+  post:
+    name: "Stage 8 · Post"
+    runs-on: ubuntu-latest
+    # Run after the last substantive stage; 'always()' ensures this job runs
+    # even when earlier stages fail.
+    needs:
+      - init
+      - build
+      - integration
+      - acceptance
+      - performance
+      - promote
+      - release
+    if: always()
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ---- Compute overall pipeline status --------------------------------
+      - name: Determine pipeline result
+        id: result
+        run: |
+          INIT="${{ needs.init.result }}"
+          BUILD="${{ needs.build.result }}"
+          INTEG="${{ needs.integration.result }}"
+          ACCEPT="${{ needs.acceptance.result }}"
+          PERF="${{ needs.performance.result }}"
+          PROMOTE="${{ needs.promote.result }}"
+          RELEASE="${{ needs.release.result }}"
+
+          # Any failure or cancellation → overall FAILED
+          OVERALL="success"
+          for S in "$INIT" "$BUILD" "$INTEG" "$ACCEPT" "$PERF" "$PROMOTE" "$RELEASE"; do
+            if [[ "$S" == "failure" || "$S" == "cancelled" ]]; then
+              OVERALL="failure"
+              break
+            fi
+          done
+          echo "overall=$OVERALL" >> "$GITHUB_OUTPUT"
+          echo "Pipeline overall result: $OVERALL"
+
+      # ---- Print pipeline summary ----------------------------------------
+      - name: Print final pipeline summary
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════╗"
+          echo "║              PIPELINE SUMMARY                ║"
+          echo "╚══════════════════════════════════════════════╝"
+          echo ""
+          printf "  %-20s %s\n" "Init:"         "${{ needs.init.result }}"
+          printf "  %-20s %s\n" "Build:"        "${{ needs.build.result }}"
+          printf "  %-20s %s\n" "Integration:"  "${{ needs.integration.result }}"
+          printf "  %-20s %s\n" "Acceptance:"   "${{ needs.acceptance.result }}"
+          printf "  %-20s %s\n" "Performance:"  "${{ needs.performance.result }}"
+          printf "  %-20s %s\n" "Promote:"      "${{ needs.promote.result }}"
+          printf "  %-20s %s\n" "Release:"      "${{ needs.release.result }}"
+          echo ""
+          printf "  %-20s %s\n" "Overall:"      "${{ steps.result.outputs.overall }}"
+          echo ""
+          echo "  Repository : ${{ github.repository }}"
+          echo "  Branch     : ${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          echo "  Commit     : ${{ github.sha }}"
+          echo "  Run URL    : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo ""
+
+      # ---- Send Slack notification ----------------------------------------
+      - name: Send Slack notification
+        if: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          RESULT: ${{ steps.result.outputs.overall }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          SHA: ${{ github.sha }}
+          RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          if [[ "$RESULT" == "success" ]]; then
+            ICON=":white_check_mark:"
+            COLOR="good"
+          else
+            ICON=":x:"
+            COLOR="danger"
+          fi
+
+          PAYLOAD=$(cat <<JSON
+          {
+            "attachments": [
+              {
+                "color": "${COLOR}",
+                "blocks": [
+                  {
+                    "type": "header",
+                    "text": {
+                      "type": "plain_text",
+                      "text": "${ICON} Stock App CI/CD — ${RESULT^^}"
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "fields": [
+                      { "type": "mrkdwn", "text": "*Repository:*\n${{ github.repository }}" },
+                      { "type": "mrkdwn", "text": "*Branch:*\n${BRANCH}" },
+                      { "type": "mrkdwn", "text": "*Commit:*\n\`${SHA:0:8}\`" },
+                      { "type": "mrkdwn", "text": "*Run #:*\n${{ github.run_number }}" }
+                    ]
+                  },
+                  {
+                    "type": "actions",
+                    "elements": [
+                      {
+                        "type": "button",
+                        "text": { "type": "plain_text", "text": "View Run" },
+                        "url": "${RUN_URL}"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+          JSON
+          )
+
+          curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$SLACK_WEBHOOK_URL"
+
+      # ---- Clean up runner workspace --------------------------------------
+      - name: Clean up temporary files
+        if: always()
+        run: |
+          echo "Cleaning up temporary CI artefacts from runner..."
+          rm -rf dist/ build/ *.egg-info/ .coverage htmlcov/ \
+                 bandit-report.txt gunicorn*.log \
+                 locust-results*.csv locust-report.html \
+                 junit-report.xml coverage.xml release-notes.md || true
+          echo "Cleanup complete."
