@@ -8,20 +8,20 @@ def prediction(stock, n_days):
     from dash.exceptions import PreventUpdate
     import pandas as pd
     import plotly.graph_objs as go
-    import plotly.express as 
+    import plotly.express as px
     # model
     from model import prediction
     from sklearn.model_selection import train_test_split
     from sklearn.model_selection import GridSearchCV
-    import numpy as 
+    import numpy as np
     from sklearn.svm import SVR
     from datetime import date, timedelta
-    # load the data
+    # load the dat
 
     df = yf.download(stock, period='60d')
     df.reset_index(inplace=True)
-    df['Day'] = df index
-    x = undefined_variable
+    df['Day'] = df.index
+    x = df['Day']
 
     days = list()
     for i in range(len(df.Day)):
