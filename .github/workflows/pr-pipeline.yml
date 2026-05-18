@@ -231,20 +231,18 @@ jobs:
             -v
 
       # ---- Enforce coverage threshold -------------------------------------
-      - name: Enforce coverage threshold (${{ env.COVERAGE_THRESHOLD }}%)
+      - name: Enforce coverage threshold
         run: |
-          python - <<'EOF'
-          import xml.etree.ElementTree as ET, sys
-          tree = ET.parse("coverage.xml")
-          root = tree.getroot()
-          pct = float(root.attrib.get("line-rate", 0)) * 100
-          threshold = int("${{ env.COVERAGE_THRESHOLD }}")
-          print(f"Coverage: {pct:.2f}%  (threshold: {threshold}%)")
-          if pct < threshold:
-              print(f"FAIL: coverage {pct:.2f}% is below the {threshold}% threshold.")
-              sys.exit(1)
-          print("PASS: coverage threshold met.")
-          EOF
+          THRESHOLD=${{ env.COVERAGE_THRESHOLD }}
+          RATE=$(grep -oP 'line-rate="\K[^"]+' coverage.xml | head -1)
+          PCT=$(echo "$RATE * 100" | bc -l | xargs printf "%.2f")
+          echo "Coverage: ${PCT}%  (threshold: ${THRESHOLD}%)"
+          PASS=$(echo "$RATE * 100 >= $THRESHOLD" | bc -l)
+          if [[ "$PASS" -eq 0 ]]; then
+            echo "FAIL: coverage ${PCT}% is below the ${THRESHOLD}% threshold."
+            exit 1
+          fi
+          echo "PASS: coverage threshold met."
 
       # ---- Upload reports -------------------------------------------------
       - name: Upload JUnit test report
@@ -412,41 +410,32 @@ jobs:
       # ---- Check CSV results for threshold breaches -----------------------
       - name: Validate performance thresholds
         run: |
-          python - <<'EOF'
-          import csv, sys
-
-          P95_LIMIT_MS  = 2000
-          FAIL_RATE_MAX = 0.01   # 1 %
-
-          try:
-              with open("locust-results_stats.csv") as f:
-                  rows = list(csv.DictReader(f))
-          except FileNotFoundError:
-              print("No CSV stats file found -- skipping threshold check.")
-              sys.exit(0)
-
-          breaches = []
-          for row in rows:
-              name = row.get("Name", "")
-              if name == "Aggregated":
-                  p95 = float(row.get("95%", 0) or 0)
-                  fail_pct = float(row.get("Failure Count", 0) or 0) / \
-                             max(float(row.get("Request Count", 1) or 1), 1)
-
-                  print(f"  p95 response time : {p95:.0f} ms  (limit: {P95_LIMIT_MS} ms)")
-                  print(f"  Failure rate      : {fail_pct*100:.2f}%  (limit: {FAIL_RATE_MAX*100:.0f}%)")
-
-                  if p95 > P95_LIMIT_MS:
-                      breaches.append(f"p95 {p95:.0f} ms > {P95_LIMIT_MS} ms")
-                  if fail_pct > FAIL_RATE_MAX:
-                      breaches.append(f"failure rate {fail_pct*100:.2f}% > {FAIL_RATE_MAX*100:.0f}%")
-
-          if breaches:
-              for b in breaches:
-                  print(f"THRESHOLD BREACH: {b}")
-              sys.exit(1)
-          print("All performance thresholds met.")
-          EOF
+          P95_LIMIT_MS=2000
+          FAIL_RATE_MAX_PCT=1
+          if [[ ! -f locust-results_stats.csv ]]; then
+            echo "No CSV stats file found -- skipping threshold check."
+            exit 0
+          fi
+          # Extract Aggregated row values using awk
+          P95=$(awk -F',' 'NR>1 && $1=="Aggregated" {print $14}' locust-results_stats.csv)
+          FAIL_COUNT=$(awk -F',' 'NR>1 && $1=="Aggregated" {print $10}' locust-results_stats.csv)
+          REQ_COUNT=$(awk -F',' 'NR>1 && $1=="Aggregated" {print $2}' locust-results_stats.csv)
+          P95=${P95:-0}
+          FAIL_COUNT=${FAIL_COUNT:-0}
+          REQ_COUNT=${REQ_COUNT:-1}
+          FAIL_PCT=$(echo "scale=2; $FAIL_COUNT * 100 / $REQ_COUNT" | bc)
+          echo "p95 response time: ${P95} ms (limit: ${P95_LIMIT_MS} ms)"
+          echo "Failure rate: ${FAIL_PCT}% (limit: ${FAIL_RATE_MAX_PCT}%)"
+          BREACH=0
+          if (( $(echo "$P95 > $P95_LIMIT_MS" | bc -l) )); then
+            echo "THRESHOLD BREACH: p95 ${P95} ms > ${P95_LIMIT_MS} ms"
+            BREACH=1
+          fi
+          if (( $(echo "$FAIL_PCT > $FAIL_RATE_MAX_PCT" | bc -l) )); then
+            echo "THRESHOLD BREACH: failure rate ${FAIL_PCT}% > ${FAIL_RATE_MAX_PCT}%"
+            BREACH=1
+          fi
+          [[ "$BREACH" -eq 0 ]] && echo "All performance thresholds met." || exit 1
 
       # ---- Upload Locust report -------------------------------------------
       - name: Upload Locust HTML report
