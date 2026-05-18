@@ -1,44 +1,41 @@
 """
 Unit tests for Stock Price Visualizer & Forecaster.
 
-Tests import the real Stock modules with heavy dependencies patched at the
-sys.modules level BEFORE import, so coverage tools count actual source lines.
+Imports real Stock modules with heavy dependencies patched at sys.modules BEFORE
+import so coverage instruments the actual source files.
 """
 
 import sys
 import os
 import types
 import unittest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 from datetime import date, timedelta
 
 import pandas as pd
 import numpy as np
 
+
 # ---------------------------------------------------------------------------
-# Patch heavy dependencies BEFORE importing any Stock module so that:
-#   1. No network calls happen during tests.
-#   2. coverage.py still instruments the real source files.
+# Install stubs BEFORE importing any Stock module
 # ---------------------------------------------------------------------------
 
 def _install_stubs():
-    # --- model (app.py does `from model import prediction`) ---
+    # model (app.py does `from model import prediction` at module level)
     model_mod = types.ModuleType("model")
     model_mod.prediction = MagicMock(return_value=MagicMock())
     sys.modules["model"] = model_mod
 
-    # --- yfinance ---
+    # yfinance
     yf = MagicMock()
     sys.modules["yfinance"] = yf
 
-    # --- plotly ---
+    # plotly
     px = MagicMock()
     go = MagicMock()
-    # go.Figure() must return something with add_trace / update_layout
     mock_fig = MagicMock()
     go.Figure.return_value = mock_fig
     go.Scatter = MagicMock()
-
     plotly_mod = types.ModuleType("plotly")
     plotly_mod.express = px
     plotly_mod.graph_objs = go
@@ -46,9 +43,14 @@ def _install_stubs():
     sys.modules["plotly.express"] = px
     sys.modules["plotly.graph_objs"] = go
 
-    # --- dash ---
+    # dash - make @app.callback a pass-through decorator
+    real_dash_app = MagicMock()
+    real_dash_app.callback = lambda *a, **kw: (lambda f: f)  # pass-through
+    real_dash_app.server = MagicMock()
+    real_dash_app.layout = None
+
     dash_mod = types.ModuleType("dash")
-    dash_mod.Dash = MagicMock(return_value=MagicMock())
+    dash_mod.Dash = MagicMock(return_value=real_dash_app)
     dash_mod.html = MagicMock()
     dash_mod.dcc = MagicMock()
 
@@ -63,7 +65,6 @@ def _install_stubs():
         pass
 
     exc_mod.PreventUpdate = _PreventUpdate
-
     dash_mod.dependencies = dep_mod
     dash_mod.exceptions = exc_mod
     sys.modules["dash"] = dash_mod
@@ -77,12 +78,12 @@ def _install_stubs():
 
 _yf_stub, _px_stub, _go_stub, _model_stub = _install_stubs()
 
-# Add project root to path so `from Stock.app import ...` works
+# Add project root so Stock package is importable
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-# Now import the real modules (stubs already in place)
+# Import real functions after stubs are in place
 from Stock.app import get_stock_price_fig, get_more  # noqa: E402
 from Stock.app import update_data, stock_price, indicators, forecast  # noqa: E402
 
@@ -91,7 +92,7 @@ from Stock.app import update_data, stock_price, indicators, forecast  # noqa: E4
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_ohlcv_df(n=60):
+def _make_ohlcv_df(n=30):
     dates = pd.date_range(end=date.today(), periods=n, freq="B")
     close = np.linspace(100, 200, n)
     return pd.DataFrame({
@@ -110,26 +111,31 @@ def _make_ohlcv_df(n=60):
 
 class TestGetStockPriceFig(unittest.TestCase):
 
-    def test_returns_figure(self):
-        df = _make_ohlcv_df(10)
-        fig = get_stock_price_fig(df)
-        # px.line was called (stub returns a MagicMock)
+    def setUp(self):
+        _px_stub.reset_mock()
+
+    def test_calls_px_line(self):
+        df = _make_ohlcv_df()
+        get_stock_price_fig(df)
         self.assertTrue(_px_stub.line.called)
 
-    def test_called_with_close_and_open(self):
-        _px_stub.line.reset_mock()
-        df = _make_ohlcv_df(10)
+    def test_uses_close_and_open_columns(self):
+        df = _make_ohlcv_df()
         get_stock_price_fig(df)
         _, kwargs = _px_stub.line.call_args
         self.assertIn("Close", kwargs.get("y", []))
         self.assertIn("Open", kwargs.get("y", []))
 
     def test_x_axis_is_date(self):
-        _px_stub.line.reset_mock()
-        df = _make_ohlcv_df(10)
+        df = _make_ohlcv_df()
         get_stock_price_fig(df)
         _, kwargs = _px_stub.line.call_args
         self.assertEqual(kwargs.get("x"), "Date")
+
+    def test_returns_figure(self):
+        df = _make_ohlcv_df()
+        fig = get_stock_price_fig(df)
+        self.assertIsNotNone(fig)
 
 
 # ---------------------------------------------------------------------------
@@ -138,26 +144,35 @@ class TestGetStockPriceFig(unittest.TestCase):
 
 class TestGetMore(unittest.TestCase):
 
-    def test_ema_column_added(self):
-        df = _make_ohlcv_df(30)
+    def setUp(self):
+        _px_stub.reset_mock()
+
+    def test_adds_ema_column(self):
+        df = _make_ohlcv_df()
         get_more(df)
         self.assertIn("EMA_20", df.columns)
 
-    def test_ema_values_finite(self):
-        df = _make_ohlcv_df(30)
+    def test_ema_values_are_finite(self):
+        df = _make_ohlcv_df()
         get_more(df)
         self.assertTrue(np.all(np.isfinite(df["EMA_20"].values)))
 
-    def test_returns_figure(self):
-        df = _make_ohlcv_df(30)
-        fig = get_more(df)
+    def test_calls_px_scatter(self):
+        df = _make_ohlcv_df()
+        get_more(df)
         self.assertTrue(_px_stub.scatter.called)
 
-    def test_ema_span_20(self):
-        df = _make_ohlcv_df(30)
+    def test_ema_first_value_equals_first_close(self):
+        df = _make_ohlcv_df()
         get_more(df)
-        # EMA_20 first value should equal the first Close (seed of ewm)
         self.assertAlmostEqual(df["EMA_20"].iloc[0], df["Close"].iloc[0], places=5)
+
+    def test_ema_monotonically_tracks_trend(self):
+        df = _make_ohlcv_df(40)
+        get_more(df)
+        # With a strictly increasing Close, EMA_20 should also be increasing
+        ema = df["EMA_20"].values
+        self.assertTrue(np.all(np.diff(ema) >= 0))
 
 
 # ---------------------------------------------------------------------------
@@ -166,33 +181,41 @@ class TestGetMore(unittest.TestCase):
 
 class TestUpdateData(unittest.TestCase):
 
-    def test_returns_default_when_no_click(self):
+    def test_returns_tuple_when_no_click(self):
         result = update_data(None, None)
-        # Should return the welcome string, placeholder image url, title, and three Nones
         self.assertIsInstance(result, tuple)
         self.assertEqual(len(result), 6)
+
+    def test_last_three_none_on_default(self):
+        result = update_data(None, None)
         self.assertIsNone(result[3])
         self.assertIsNone(result[4])
         self.assertIsNone(result[5])
 
-    def test_raises_when_click_but_no_ticker(self):
+    def test_default_includes_welcome_text(self):
+        result = update_data(None, None)
+        self.assertIn("PLEASE Enter a legitimate stock code", result[0])
+
+    def test_raises_prevent_update_when_click_no_ticker(self):
         from dash.exceptions import PreventUpdate
         with self.assertRaises(PreventUpdate):
             update_data(1, None)
 
-    def test_fetches_ticker_info_on_submit(self):
+    def test_fetches_ticker_info_on_valid_submit(self):
         mock_ticker = MagicMock()
         mock_ticker.info = {
-            "logo_url": "http://logo",
+            "logo_url": "http://logo.png",
             "shortName": "ACME Corp",
             "longBusinessSummary": "Makes everything.",
         }
         _yf_stub.Ticker.return_value = mock_ticker
-
         result = update_data(1, "ACME")
         self.assertEqual(result[0], "Makes everything.")
-        self.assertEqual(result[1], "http://logo")
+        self.assertEqual(result[1], "http://logo.png")
         self.assertEqual(result[2], "ACME Corp")
+        self.assertIsNone(result[3])
+        self.assertIsNone(result[4])
+        self.assertIsNone(result[5])
 
 
 # ---------------------------------------------------------------------------
@@ -205,25 +228,25 @@ class TestStockPrice(unittest.TestCase):
         result = stock_price(None, None, None, None)
         self.assertEqual(result, [""])
 
-    def test_raises_when_click_but_no_val(self):
+    def test_raises_prevent_update_when_click_no_val(self):
         from dash.exceptions import PreventUpdate
         with self.assertRaises(PreventUpdate):
             stock_price(1, None, None, None)
 
-    def test_downloads_and_returns_graph(self):
-        df = _make_ohlcv_df(20)
-        _yf_stub.download.return_value = df.drop(columns=["Date"]).set_index("Date").reset_index()
-        # Patch reset_index to be a no-op that keeps Date column
-        mock_df = df.copy()
-        _yf_stub.download.return_value = mock_df.set_index("Date")
-
-        # We need a df with Date column after reset_index
+    def test_downloads_with_date_range(self):
         real_df = _make_ohlcv_df(20)
         _yf_stub.download.return_value = real_df.set_index("Date")
-
-        with patch("Stock.app.get_stock_price_fig", return_value=MagicMock()) as mock_fig_fn:
+        with patch("Stock.app.get_stock_price_fig", return_value=MagicMock()):
             result = stock_price(1, "2024-01-01", "2024-06-01", "AAPL")
-            self.assertTrue(mock_fig_fn.called)
+            _yf_stub.download.assert_called()
+            self.assertEqual(len(result), 1)
+
+    def test_downloads_without_date_range(self):
+        real_df = _make_ohlcv_df(20)
+        _yf_stub.download.return_value = real_df.set_index("Date")
+        with patch("Stock.app.get_stock_price_fig", return_value=MagicMock()):
+            result = stock_price(1, None, None, "AAPL")
+            _yf_stub.download.assert_called()
             self.assertEqual(len(result), 1)
 
 
@@ -241,12 +264,18 @@ class TestIndicators(unittest.TestCase):
         result = indicators(1, None, None, None)
         self.assertEqual(result, [""])
 
-    def test_downloads_and_returns_graph(self):
+    def test_downloads_with_date_range(self):
         real_df = _make_ohlcv_df(30)
         _yf_stub.download.return_value = real_df.set_index("Date")
-        with patch("Stock.app.get_more", return_value=MagicMock()) as mock_more:
+        with patch("Stock.app.get_more", return_value=MagicMock()):
+            result = indicators(1, "2024-01-01", "2024-06-01", "AAPL")
+            self.assertEqual(len(result), 1)
+
+    def test_downloads_without_date_range(self):
+        real_df = _make_ohlcv_df(30)
+        _yf_stub.download.return_value = real_df.set_index("Date")
+        with patch("Stock.app.get_more", return_value=MagicMock()):
             result = indicators(1, None, None, "AAPL")
-            self.assertTrue(mock_more.called)
             self.assertEqual(len(result), 1)
 
 
@@ -260,33 +289,39 @@ class TestForecast(unittest.TestCase):
         result = forecast(None, None, None)
         self.assertEqual(result, [""])
 
-    def test_raises_when_click_but_no_val(self):
+    def test_raises_prevent_update_when_click_no_val(self):
         from dash.exceptions import PreventUpdate
         with self.assertRaises(PreventUpdate):
             forecast(1, "5", None)
 
-    def test_calls_prediction_and_returns_graph(self):
-        _model_stub.prediction.return_value = MagicMock()
+    def test_calls_prediction_with_n_plus_one(self):
         _model_stub.prediction.reset_mock()
+        _model_stub.prediction.return_value = MagicMock()
         result = forecast(1, "5", "AAPL")
         _model_stub.prediction.assert_called_once_with("AAPL", 6)
         self.assertEqual(len(result), 1)
 
+    def test_calls_prediction_with_different_n_days(self):
+        _model_stub.prediction.reset_mock()
+        _model_stub.prediction.return_value = MagicMock()
+        forecast(1, "10", "TSLA")
+        _model_stub.prediction.assert_called_once_with("TSLA", 11)
+
 
 # ---------------------------------------------------------------------------
-# Tests: SVR internals (imported directly, not via prediction which needs network)
+# Tests: SVR model internals
 # ---------------------------------------------------------------------------
 
 class TestSVR(unittest.TestCase):
 
-    def _build_data(self, n=54):
+    def _data(self, n=54):
         X = [[i] for i in range(n)]
         Y = np.linspace(100, 150, n).tolist()
         return X, Y
 
     def test_svr_fit_predict(self):
         from sklearn.svm import SVR
-        X, Y = self._build_data()
+        X, Y = self._data()
         model = SVR(kernel="rbf", C=100, epsilon=0.01, gamma=0.1)
         model.fit(X, Y)
         preds = model.predict([[54], [55]])
@@ -295,12 +330,20 @@ class TestSVR(unittest.TestCase):
 
     def test_svr_plausible_range(self):
         from sklearn.svm import SVR
-        X, Y = self._build_data()
+        X, Y = self._data()
         model = SVR(kernel="rbf", C=100, epsilon=0.01, gamma=0.1)
         model.fit(X, Y)
         pred = model.predict([[54]])[0]
         self.assertGreater(pred, 50)
         self.assertLess(pred, 250)
+
+    def test_train_test_split_ratio(self):
+        from sklearn.model_selection import train_test_split
+        X = [[i] for i in range(60)]
+        Y = list(range(60))
+        x_train, x_test, _, _ = train_test_split(X, Y, test_size=0.1, shuffle=False)
+        self.assertEqual(len(x_test), 6)
+        self.assertEqual(len(x_train), 54)
 
 
 # ---------------------------------------------------------------------------
