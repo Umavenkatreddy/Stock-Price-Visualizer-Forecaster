@@ -24,7 +24,7 @@ on:
 # Cancel in-flight runs for the same branch/PR when a new push arrives.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared env-level defaults
@@ -41,6 +41,7 @@ jobs:
   init:
     name: "Stage 1 · Init"
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       branch:      ${{ steps.meta.outputs.branch }}
       is_main:     ${{ steps.meta.outputs.is_main }}
@@ -114,6 +115,7 @@ jobs:
   build:
     name: "Stage 2 · Build"
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: init
 
     steps:
@@ -190,6 +192,7 @@ jobs:
   integration:
     name: "Stage 3 · Integration"
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: build
 
     steps:
@@ -267,6 +270,7 @@ jobs:
   acceptance:
     name: "Stage 4 · Acceptance"
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: integration
     # Skip for plain feature-branch pushes (not PRs)
     if: |
@@ -353,6 +357,7 @@ jobs:
   performance:
     name: "Stage 5 · Performance"
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: acceptance
     if: |
       github.event_name == 'pull_request' ||
