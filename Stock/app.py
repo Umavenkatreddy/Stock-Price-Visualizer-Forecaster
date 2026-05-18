@@ -1,15 +1,13 @@
 import dash
-from dash import Dash, html, dcc
+from dash import html, dcc
 from datetime import datetime as dt
 import yfinance as yf
 from dash.dependencies import Input, Output, State
 from dash.exceptions import PreventUpdate
 import pandas as pd
-import plotly.graph_objs as go
 import plotly.express as px
 # model
 from model import prediction
-from sklearn.svm import SVR
 
 
 def get_stock_price_fig(df):
@@ -109,11 +107,11 @@ app.layout = html.Div(
     Output("forecast", "n_clicks")
 ], [Input("submit", "n_clicks")], [State("dropdown_tickers", "value")])
 def update_data(n, val):  # input parameter(s)
-    if n == None:
-        return "Data Visualization in stock market helps traders when making decisions quickly and enables them to easily synthesize large amount of complex information.* PLEASE Enter a legitimate stock code to get the details.*","https://i.im.ge/2022/06/11/rHQ4qz.jpg", "STOCKS FORECASTER🕵️ AND VISUALIZER", None, None, None
+    if n is None:
+        return "Data Visualization in stock market helps traders when making decisions quickly and enables them to easily synthesize large amount of complex information.* PLEASE Enter a legitimate stock code to get the details.*", "https://i.im.ge/2022/06/11/rHQ4qz.jpg", "STOCKS FORECASTER🕵️ AND VISUALIZER", None, None, None
         # raise PreventUpdate
     else:
-        if val == None:
+        if val is None:
             raise PreventUpdate
         else:
             ticker = yf.Ticker(val)
@@ -133,13 +131,13 @@ def update_data(n, val):  # input parameter(s)
     Input('my-date-picker-range', 'end_date')
 ], [State("dropdown_tickers", "value")])
 def stock_price(n, start_date, end_date, val):
-    if n == None:
+    if n is None:
         return [""]
-        #raise PreventUpdate
-    if val == None:
+        # raise PreventUpdate
+    if val is None:
         raise PreventUpdate
     else:
-        if start_date != None:
+        if start_date is not None:
             df = yf.download(val, str(start_date), str(end_date))
         else:
             df = yf.download(val)
@@ -156,12 +154,12 @@ def stock_price(n, start_date, end_date, val):
     Input('my-date-picker-range', 'end_date')
 ], [State("dropdown_tickers", "value")])
 def indicators(n, start_date, end_date, val):
-    if n == None:
+    if n is None:
         return [""]
-    if val == None:
+    if val is None:
         return [""]
 
-    if start_date == None:
+    if start_date is None:
         df_more = yf.download(val)
     else:
         df_more = yf.download(val, str(start_date), str(end_date))
@@ -177,9 +175,9 @@ def indicators(n, start_date, end_date, val):
               [State("n_days", "value"),
                State("dropdown_tickers", "value")])
 def forecast(n, n_days, val):
-    if n == None:
+    if n is None:
         return [""]
-    if val == None:
+    if val is None:
         raise PreventUpdate
     fig = prediction(val, int(n_days) + 1)
     return [dcc.Graph(figure=fig)]
