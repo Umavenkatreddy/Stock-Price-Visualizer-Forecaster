@@ -1,8 +1,6 @@
 def prediction(stock, n_days):
     import yfinance as yf
-    import pandas as pd
     import plotly.graph_objs as go
-    import numpy as np
     from sklearn.model_selection import train_test_split
     from sklearn.model_selection import GridSearchCV
     from sklearn.svm import SVR
@@ -56,7 +54,7 @@ def prediction(stock, n_days):
     # Support Vector Regression Models
 
     # RBF model
-    #rbf_svr = SVR(kernel='rbf', C=1000.0, gamma=4.0)
+    # rbf_svr = SVR(kernel='rbf', C=1000.0, gamma=4.0)
     rbf_svr = best_svr
 
     rbf_svr.fit(x_train, y_train)
@@ -74,7 +72,7 @@ def prediction(stock, n_days):
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
-            x=dates,  # np.array(ten_days).flatten(), 
+            x=dates,  # np.array(ten_days).flatten()
             y=rbf_svr.predict(output_days),
             mode='lines+markers',
             name='data'))
