@@ -22,6 +22,11 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 def _install_stubs():
+    # --- model (app.py does `from model import prediction`) ---
+    model_mod = types.ModuleType("model")
+    model_mod.prediction = MagicMock(return_value=MagicMock())
+    sys.modules["model"] = model_mod
+
     # --- yfinance ---
     yf = MagicMock()
     sys.modules["yfinance"] = yf
@@ -67,10 +72,10 @@ def _install_stubs():
     sys.modules["dash_core_components"] = MagicMock()
     sys.modules["dash_html_components"] = MagicMock()
 
-    return yf, px, go
+    return yf, px, go, model_mod
 
 
-_yf_stub, _px_stub, _go_stub = _install_stubs()
+_yf_stub, _px_stub, _go_stub, _model_stub = _install_stubs()
 
 # Add project root to path so `from Stock.app import ...` works
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -261,10 +266,11 @@ class TestForecast(unittest.TestCase):
             forecast(1, "5", None)
 
     def test_calls_prediction_and_returns_graph(self):
-        with patch("Stock.app.prediction", return_value=MagicMock()) as mock_pred:
-            result = forecast(1, "5", "AAPL")
-            mock_pred.assert_called_once_with("AAPL", 6)
-            self.assertEqual(len(result), 1)
+        _model_stub.prediction.return_value = MagicMock()
+        _model_stub.prediction.reset_mock()
+        result = forecast(1, "5", "AAPL")
+        _model_stub.prediction.assert_called_once_with("AAPL", 6)
+        self.assertEqual(len(result), 1)
 
 
 # ---------------------------------------------------------------------------
