@@ -1,27 +1,18 @@
 def prediction(stock, n_days):
-    import dash
-    import dash_core_components as dcc
-    import dash_html_components as html
-    from datetime import datetime as dt
     import yfinance as yf
-    from dash.dependencies import Input, Output, State
-    from dash.exceptions import PreventUpdate
     import pandas as pd
     import plotly.graph_objs as go
-    import plotly.express as 
-    # model
-    from model import prediction
+    import numpy as np
     from sklearn.model_selection import train_test_split
     from sklearn.model_selection import GridSearchCV
-    import numpy as 
     from sklearn.svm import SVR
     from datetime import date, timedelta
     # load the data
 
     df = yf.download(stock, period='60d')
     df.reset_index(inplace=True)
-    df['Day'] = df index
-    x = undefined_variable
+    df['Day'] = df.index
+    x = df.index  # noqa: F841
 
     days = list()
     for i in range(len(df.Day)):
