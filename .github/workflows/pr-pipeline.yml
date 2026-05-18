@@ -666,6 +666,8 @@ jobs:
           RESULT: ${{ steps.result.outputs.overall }}
           BRANCH: ${{ github.head_ref || github.ref_name }}
           SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          RUN_NUMBER: ${{ github.run_number }}
           RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
           if [[ "$RESULT" == "success" ]]; then
@@ -676,44 +678,9 @@ jobs:
             COLOR="danger"
           fi
 
-          PAYLOAD=$(cat <<JSON
-          {
-            "attachments": [
-              {
-                "color": "${COLOR}",
-                "blocks": [
-                  {
-                    "type": "header",
-                    "text": {
-                      "type": "plain_text",
-                      "text": "${ICON} Stock App CI/CD -- ${RESULT^^}"
-                    }
-                  },
-                  {
-                    "type": "section",
-                    "fields": [
-                      { "type": "mrkdwn", "text": "*Repository:*\n${{ github.repository }}" },
-                      { "type": "mrkdwn", "text": "*Branch:*\n${BRANCH}" },
-                      { "type": "mrkdwn", "text": "*Commit:*\n\`${SHA:0:8}\`" },
-                      { "type": "mrkdwn", "text": "*Run #:*\n${{ github.run_number }}" }
-                    ]
-                  },
-                  {
-                    "type": "actions",
-                    "elements": [
-                      {
-                        "type": "button",
-                        "text": { "type": "plain_text", "text": "View Run" },
-                        "url": "${RUN_URL}"
-                      }
-                    ]
-                  }
-                ]
-              }
-            ]
-          }
-          JSON
-          )
+          # Build JSON payload using printf to avoid heredoc YAML parse issues
+          PAYLOAD=$(printf '{"attachments":[{"color":"%s","text":"%s Stock App CI/CD - %s | Repo: %s | Branch: %s | Commit: %s | Run: %s | URL: %s"}]}' \
+            "$COLOR" "$ICON" "${RESULT^^}" "$REPO" "$BRANCH" "${SHA:0:8}" "$RUN_NUMBER" "$RUN_URL")
 
           curl -s -X POST \
             -H "Content-Type: application/json" \
