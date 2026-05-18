@@ -24,7 +24,7 @@ on:
 # Cancel in-flight runs for the same branch/PR when a new push arrives.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: true
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared env-level defaults
