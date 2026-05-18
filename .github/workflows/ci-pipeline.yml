@@ -1,0 +1,507 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - "feature/**"
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  ARTIFACT_NAME: stock-wheel
+  COVERAGE_THRESHOLD: 70
+
+# =============================================================================
+# STAGE 1 - INIT
+# =============================================================================
+jobs:
+  init:
+    name: "Stage 1 - Init"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      branch:      ${{ steps.meta.outputs.branch }}
+      is_main:     ${{ steps.meta.outputs.is_main }}
+      short_sha:   ${{ steps.meta.outputs.short_sha }}
+      run_version: ${{ steps.meta.outputs.run_version }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Collect pipeline metadata
+        id: meta
+        run: |
+          BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          IS_MAIN="false"
+          if [[ "$BRANCH" == "main" || "$BRANCH" == "master" ]]; then
+            IS_MAIN="true"
+          fi
+          SHORT_SHA="${GITHUB_SHA::8}"
+          RUN_VERSION="v1.0.${{ github.run_number }}"
+          echo "branch=$BRANCH"           >> "$GITHUB_OUTPUT"
+          echo "is_main=$IS_MAIN"         >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA"     >> "$GITHUB_OUTPUT"
+          echo "run_version=$RUN_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Print pipeline banner
+        run: |
+          echo "================================================"
+          echo "  Stock Price Visualizer & Forecaster CI/CD"
+          echo "================================================"
+          echo "  Repository : ${{ github.repository }}"
+          echo "  Branch     : ${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          echo "  Commit SHA : ${{ github.sha }}"
+          echo "  Actor      : ${{ github.actor }}"
+          echo "  Run #      : ${{ github.run_number }}"
+          echo "  Triggered  : ${{ github.event_name }}"
+
+      - name: Validate required files
+        run: |
+          for f in requirements.txt setup.py setup.cfg locustfile.py; do
+            [[ -f "$f" ]] && echo "OK: $f" || { echo "MISSING: $f"; exit 1; }
+          done
+
+# =============================================================================
+# STAGE 2 - BUILD
+# =============================================================================
+  build:
+    name: "Stage 2 - Build"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: init
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: pip check
+        run: pip check
+
+      - name: Lint with flake8
+        run: |
+          flake8 Stock/ \
+            --max-line-length=120 \
+            --extend-ignore=E501,W503 \
+            --statistics \
+            --count
+
+      - name: Security scan with bandit
+        run: |
+          bandit -r Stock/ \
+            --severity-level medium \
+            --confidence-level medium \
+            -f txt \
+            -o bandit-report.txt || true
+          cat bandit-report.txt
+          bandit -r Stock/ \
+            --severity-level high \
+            --confidence-level high
+
+      - name: Upload bandit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-security-report
+          path: bandit-report.txt
+          retention-days: 14
+
+      - name: Build wheel
+        run: |
+          pip install --upgrade build wheel setuptools
+          python -m build --wheel --outdir dist/
+          ls -lh dist/
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist/*.whl
+          retention-days: 7
+
+# =============================================================================
+# STAGE 3 - INTEGRATION (unit tests + coverage)
+# =============================================================================
+  integration:
+    name: "Stage 3 - Integration"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist/
+
+      - name: Install wheel
+        run: pip install dist/*.whl --force-reinstall
+
+      - name: Run tests with pytest and coverage
+        run: |
+          pytest tests/ \
+            --cov=Stock \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing \
+            --junitxml=junit-report.xml \
+            -v
+
+      - name: Enforce coverage threshold
+        run: |
+          THRESHOLD=${{ env.COVERAGE_THRESHOLD }}
+          RATE=$(grep -oP 'line-rate="\K[^"]+' coverage.xml | head -1)
+          PCT=$(echo "$RATE * 100" | bc -l | xargs printf "%.2f")
+          echo "Coverage: ${PCT}%  (threshold: ${THRESHOLD}%)"
+          PASS=$(echo "$RATE * 100 >= $THRESHOLD" | bc -l)
+          if [[ "$PASS" -eq 0 ]]; then
+            echo "FAIL: coverage ${PCT}% is below ${THRESHOLD}% threshold."
+            exit 1
+          fi
+          echo "PASS: coverage threshold met."
+
+      - name: Upload JUnit test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-test-report
+          path: junit-report.xml
+          retention-days: 14
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 14
+
+# =============================================================================
+# STAGE 4 - ACCEPTANCE (smoke tests)
+# Skipped on plain feature-branch pushes
+# =============================================================================
+  acceptance:
+    name: "Stage 4 - Acceptance"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: integration
+    if: >
+      github.event_name == 'pull_request' ||
+      github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt requests
+
+      - name: Start application server
+        run: |
+          cd Stock
+          gunicorn app:server \
+            --bind 0.0.0.0:8050 \
+            --workers 1 \
+            --timeout 60 \
+            --daemon \
+            --log-file ../gunicorn.log
+          echo "Waiting for server..."
+          for i in $(seq 1 15); do
+            if curl -sf http://localhost:8050/ > /dev/null 2>&1; then
+              echo "Server is up (attempt $i)."; break
+            fi
+            sleep 2
+          done
+
+      - name: Smoke test - homepage responds 200
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8050/)
+          echo "HTTP status: $STATUS"
+          [[ "$STATUS" == "200" ]] || { echo "FAIL: expected 200, got $STATUS"; exit 1; }
+
+      - name: Smoke test - Dash layout endpoint
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8050/_dash-layout)
+          [[ "$STATUS" == "200" ]] || { echo "FAIL: expected 200, got $STATUS"; exit 1; }
+
+      - name: Smoke test - Dash dependencies endpoint
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8050/_dash-dependencies)
+          [[ "$STATUS" == "200" ]] || { echo "FAIL: expected 200, got $STATUS"; exit 1; }
+
+      - name: Upload gunicorn log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gunicorn-acceptance-log
+          path: gunicorn.log
+          retention-days: 7
+
+# =============================================================================
+# STAGE 5 - PERFORMANCE (locust load test)
+# =============================================================================
+  performance:
+    name: "Stage 5 - Performance"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: acceptance
+    if: >
+      github.event_name == 'pull_request' ||
+      github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Start application server
+        run: |
+          cd Stock
+          gunicorn app:server \
+            --bind 0.0.0.0:8050 \
+            --workers 2 \
+            --timeout 60 \
+            --daemon \
+            --log-file ../gunicorn-perf.log
+          for i in $(seq 1 15); do
+            if curl -sf http://localhost:8050/ > /dev/null 2>&1; then
+              echo "Server ready (attempt $i)."; break
+            fi
+            sleep 2
+          done
+
+      - name: Run Locust load test
+        run: |
+          locust \
+            -f locustfile.py \
+            --headless \
+            --users 10 \
+            --spawn-rate 2 \
+            --run-time 30s \
+            --host http://localhost:8050 \
+            --csv=locust-results \
+            --html=locust-report.html
+
+      - name: Validate performance thresholds
+        run: |
+          P95_LIMIT_MS=2000
+          FAIL_RATE_MAX_PCT=1
+          if [[ ! -f locust-results_stats.csv ]]; then
+            echo "No CSV stats file found - skipping threshold check."
+            exit 0
+          fi
+          P95=$(awk -F',' 'NR>1 && $1=="Aggregated" {print $14}' locust-results_stats.csv)
+          FAIL_COUNT=$(awk -F',' 'NR>1 && $1=="Aggregated" {print $10}' locust-results_stats.csv)
+          REQ_COUNT=$(awk -F',' 'NR>1 && $1=="Aggregated" {print $2}' locust-results_stats.csv)
+          P95=${P95:-0}; FAIL_COUNT=${FAIL_COUNT:-0}; REQ_COUNT=${REQ_COUNT:-1}
+          FAIL_PCT=$(echo "scale=2; $FAIL_COUNT * 100 / $REQ_COUNT" | bc)
+          echo "p95: ${P95}ms (limit: ${P95_LIMIT_MS}ms)"
+          echo "Failure rate: ${FAIL_PCT}% (limit: ${FAIL_RATE_MAX_PCT}%)"
+          BREACH=0
+          if (( $(echo "$P95 > $P95_LIMIT_MS" | bc -l) )); then echo "BREACH: p95"; BREACH=1; fi
+          if (( $(echo "$FAIL_PCT > $FAIL_RATE_MAX_PCT" | bc -l) )); then echo "BREACH: failure rate"; BREACH=1; fi
+          [[ "$BREACH" -eq 0 ]] && echo "All performance thresholds met." || exit 1
+
+      - name: Upload Locust report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: locust-performance-report
+          path: |
+            locust-report.html
+            locust-results_stats.csv
+            locust-results_failures.csv
+          retention-days: 14
+
+# =============================================================================
+# STAGE 6 - PROMOTE (tag + GitHub Release)
+# Runs only on main branch pushes
+# =============================================================================
+  promote:
+    name: "Stage 6 - Promote"
+    runs-on: ubuntu-latest
+    needs: performance
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist/
+
+      - name: Create version tag
+        id: tag
+        run: |
+          VERSION="v1.0.${{ github.run_number }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "Release $VERSION - promoted by CI run #${{ github.run_number }}"
+          git push origin "$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [[ -n "$PREV_TAG" ]]; then
+            LOG=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s (%h)" --no-merges)
+          else
+            LOG=$(git log --pretty=format:"- %s (%h)" --no-merges -20)
+          fi
+          echo "## What Changed" > release-notes.md
+          echo "" >> release-notes.md
+          echo "$LOG" >> release-notes.md
+          cat release-notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:  ${{ steps.tag.outputs.version }}
+          name:      "Release ${{ steps.tag.outputs.version }}"
+          body_path: release-notes.md
+          files:     dist/*.whl
+          draft:     false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+# =============================================================================
+# STAGE 7 - RELEASE (publish to PyPI Test)
+# =============================================================================
+  release:
+    name: "Stage 7 - Release (PyPI Test)"
+    runs-on: ubuntu-latest
+    needs: promote
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: pypi-test
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Twine
+        run: pip install twine
+
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist/
+
+      - name: Validate package
+        run: twine check dist/*.whl
+
+      - name: Publish to PyPI Test
+        env:
+          TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
+          TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
+        run: |
+          twine upload \
+            --repository-url https://test.pypi.org/legacy/ \
+            --skip-existing \
+            dist/*.whl
+
+# =============================================================================
+# STAGE 8 - POST (always runs)
+# =============================================================================
+  post:
+    name: "Stage 8 - Post"
+    runs-on: ubuntu-latest
+    needs:
+      - init
+      - build
+      - integration
+      - acceptance
+      - performance
+      - promote
+      - release
+    if: always()
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine pipeline result
+        id: result
+        run: |
+          OVERALL="success"
+          for S in "${{ needs.init.result }}" "${{ needs.build.result }}" "${{ needs.integration.result }}" "${{ needs.acceptance.result }}" "${{ needs.performance.result }}" "${{ needs.promote.result }}" "${{ needs.release.result }}"; do
+            if [[ "$S" == "failure" || "$S" == "cancelled" ]]; then
+              OVERALL="failure"; break
+            fi
+          done
+          echo "overall=$OVERALL" >> "$GITHUB_OUTPUT"
+          echo "Pipeline result: $OVERALL"
+
+      - name: Print pipeline summary
+        run: |
+          echo "================================================"
+          echo "  PIPELINE SUMMARY"
+          echo "================================================"
+          printf "  %-20s %s\n" "Init:"        "${{ needs.init.result }}"
+          printf "  %-20s %s\n" "Build:"       "${{ needs.build.result }}"
+          printf "  %-20s %s\n" "Integration:" "${{ needs.integration.result }}"
+          printf "  %-20s %s\n" "Acceptance:"  "${{ needs.acceptance.result }}"
+          printf "  %-20s %s\n" "Performance:" "${{ needs.performance.result }}"
+          printf "  %-20s %s\n" "Promote:"     "${{ needs.promote.result }}"
+          printf "  %-20s %s\n" "Release:"     "${{ needs.release.result }}"
+          echo "------------------------------------------------"
+          printf "  %-20s %s\n" "Overall:"     "${{ steps.result.outputs.overall }}"
+          echo "  Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Clean up temporary files
+        if: always()
+        run: |
+          rm -rf dist/ build/ *.egg-info/ .coverage htmlcov/ \
+                 bandit-report.txt gunicorn*.log \
+                 locust-results*.csv locust-report.html \
+                 junit-report.xml coverage.xml release-notes.md || true
+          echo "Cleanup complete."
