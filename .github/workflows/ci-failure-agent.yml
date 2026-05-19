@@ -1,0 +1,327 @@
+name: CI Failure Agent
+
+on:
+  workflow_run:
+    workflows:
+      - "CI/CD Pipeline"
+    types:
+      - completed
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+
+jobs:
+  analyze-failure:
+    name: "Analyze CI Failure & Post Report"
+    runs-on: ubuntu-latest
+    # Only fire when the triggering workflow failed AND was triggered by a pull_request event
+    if: >
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'pull_request'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install anthropic requests
+
+      # -----------------------------------------------------------------------
+      # Resolve the PR number from the triggering workflow_run
+      # -----------------------------------------------------------------------
+      - name: Resolve PR number
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          REPO: ${{ github.repository }}
+        run: |
+          PR_NUMBER=$(gh api \
+            "repos/${REPO}/actions/runs/${RUN_ID}" \
+            --jq '.pull_requests[0].number // empty')
+
+          # Fallback: search open PRs matching head SHA
+          if [[ -z "$PR_NUMBER" ]]; then
+            HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
+            PR_NUMBER=$(gh api \
+              "repos/${REPO}/pulls?state=open&per_page=100" \
+              --jq --arg sha "$HEAD_SHA" \
+              '.[] | select(.head.sha == $sha) | .number' | head -1)
+          fi
+
+          if [[ -z "$PR_NUMBER" ]]; then
+            echo "Could not resolve PR number — skipping agent."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "PR number: $PR_NUMBER"
+            echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # -----------------------------------------------------------------------
+      # Guard: skip if bot already commented on this run (loop prevention)
+      # -----------------------------------------------------------------------
+      - name: Check for existing bot comment
+        id: guard
+        if: steps.pr.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          MARKER="<!-- ci-failure-agent run_id=${RUN_ID} -->"
+          EXISTS=$(gh api \
+            "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" \
+            --jq --arg marker "$MARKER" \
+            '.[] | select(.body | contains($marker)) | .id' | head -1)
+          if [[ -n "$EXISTS" ]]; then
+            echo "Bot already commented for this run. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # -----------------------------------------------------------------------
+      # Collect evidence: failed logs + git diff
+      # -----------------------------------------------------------------------
+      - name: Collect failed job logs
+        id: logs
+        if: steps.pr.outputs.found == 'true' && steps.guard.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          # Fetch raw failed-job logs
+          gh run view "$RUN_ID" --log-failed > raw_logs.txt 2>&1 || true
+
+          python3 - << 'PYEOF'
+          import re, sys
+
+          with open("raw_logs.txt", encoding="utf-8", errors="replace") as f:
+              raw = f.read()
+
+          # Strip ANSI escape codes
+          raw = re.sub(r'\x1B\[[0-9;]*[mK]', '', raw)
+          # Strip leading timestamps (2026-05-19T14:32:01.123Z)
+          raw = re.sub(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z\s*', '', raw)
+          # Remove GitHub Actions group markers
+          raw = re.sub(r'##\[(group|endgroup)\].*', '', raw)
+
+          lines = raw.splitlines()
+
+          # Extract signal lines: errors, failures, exceptions, tracebacks
+          signal_pattern = re.compile(
+              r'(error|fail|exception|traceback|assert|syntax|import|undefined|'
+              r'cannot|could not|no module|exit code [^0])',
+              re.IGNORECASE
+          )
+
+          signal_lines = []
+          for i, line in enumerate(lines):
+              if signal_pattern.search(line):
+                  # Include 3 lines of context around each match
+                  start = max(0, i - 3)
+                  end = min(len(lines), i + 4)
+                  signal_lines.extend(lines[start:end])
+                  signal_lines.append("---")
+
+          # Deduplicate while preserving order
+          seen = set()
+          deduped = []
+          for l in signal_lines:
+              if l not in seen:
+                  seen.add(l)
+                  deduped.append(l)
+
+          filtered = "\n".join(deduped)
+
+          # Hard cap at 6000 chars
+          MAX = 6000
+          if len(filtered) > MAX:
+              half = MAX // 2
+              filtered = filtered[:half] + "\n\n... [truncated] ...\n\n" + filtered[-half:]
+
+          with open("filtered_logs.txt", "w") as f:
+              f.write(filtered)
+
+          print(f"Raw log lines: {len(lines)}, Filtered chars: {len(filtered)}")
+          PYEOF
+
+      - name: Collect git diff for PR
+        id: diff
+        if: steps.pr.outputs.found == 'true' && steps.guard.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          # Fetch the PR diff via GitHub API (capped at 4000 chars)
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
+            -H "Accept: application/vnd.github.v3.diff" \
+            > pr.diff 2>/dev/null || echo "(diff unavailable)" > pr.diff
+
+          python3 - << 'PYEOF'
+          with open("pr.diff", encoding="utf-8", errors="replace") as f:
+              diff = f.read()
+
+          MAX = 4000
+          if len(diff) > MAX:
+              diff = diff[:MAX] + "\n\n... [diff truncated] ..."
+
+          with open("capped_diff.txt", "w") as f:
+              f.write(diff)
+
+          print(f"Diff size: {len(diff)} chars")
+          PYEOF
+
+      # -----------------------------------------------------------------------
+      # Call Claude API and generate the report
+      # -----------------------------------------------------------------------
+      - name: Run Claude analysis
+        id: analysis
+        if: steps.pr.outputs.found == 'true' && steps.guard.outputs.skip == 'false'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          python3 - << 'PYEOF'
+          import anthropic, os, json, sys
+
+          with open("filtered_logs.txt") as f:
+              logs = f.read()
+          with open("capped_diff.txt") as f:
+              diff = f.read()
+
+          run_url = os.environ["RUN_URL"]
+          workflow = os.environ["WORKFLOW_NAME"]
+          branch = os.environ["HEAD_BRANCH"]
+          sha = os.environ["HEAD_SHA"][:8]
+
+          prompt = f"""You are a CI failure analysis agent. A GitHub Actions workflow just failed on a pull request.
+
+          ## Context
+          - Workflow: {workflow}
+          - Branch: {branch}
+          - Commit: {sha}
+          - Run URL: {run_url}
+
+          ## Failed CI Logs (filtered — error/failure lines only)
+          ```
+          {logs}
+          ```
+
+          ## Code Changes in this PR (git diff)
+          ```diff
+          {diff}
+          ```
+
+          ## Your Task
+          Produce a structured markdown report with exactly these sections:
+
+          ### Failure Summary
+          One or two sentences. What failed and where (file, line, test name if available).
+
+          ### Root Cause Analysis
+          Explain WHY it failed. Connect the log error to the specific code change in the diff. Be precise — reference file names and line numbers from the diff where relevant.
+
+          ### Actionable Fix
+          Provide a concrete fix. Use a code block if showing a code change. Keep it minimal and targeted.
+
+          ### Confidence
+          Rate your confidence in the root cause: High / Medium / Low, and explain briefly why.
+
+          Be concise. Do not repeat the logs back verbatim. Do not add sections beyond the four above."""
+
+          client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+          message = client.messages.create(
+              model="claude-sonnet-4-6",
+              max_tokens=1024,
+              messages=[{"role": "user", "content": prompt}]
+          )
+
+          report = message.content[0].text
+
+          with open("agent_report.md", "w") as f:
+              f.write(report)
+
+          print("Claude analysis complete.")
+          print(f"Report length: {len(report)} chars")
+          PYEOF
+
+      # -----------------------------------------------------------------------
+      # Post the report as a PR comment
+      # -----------------------------------------------------------------------
+      - name: Post report as PR comment
+        if: steps.pr.outputs.found == 'true' && steps.guard.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          python3 - << 'PYEOF'
+          import os, requests, json
+
+          with open("agent_report.md") as f:
+              report = f.read()
+
+          run_id = os.environ["RUN_ID"]
+          run_url = os.environ["RUN_URL"]
+          marker = f"<!-- ci-failure-agent run_id={run_id} -->"
+
+          body = f"""{marker}
+          ## CI Failure Agent Report
+
+          > Automated analysis for failed run [{run_id}]({run_url})
+
+          {report}
+
+          ---
+          *Generated by CI Failure Agent using Claude. [View full logs]({run_url})*
+          """
+
+          token = os.environ["GH_TOKEN"]
+          repo = os.environ["REPO"]
+          pr = os.environ["PR_NUMBER"]
+
+          resp = requests.post(
+              f"https://api.github.com/repos/{repo}/issues/{pr}/comments",
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github.v3+json",
+              },
+              json={"body": body},
+          )
+
+          if resp.status_code == 201:
+              print(f"Comment posted: {resp.json()['html_url']}")
+          else:
+              print(f"Failed to post comment: {resp.status_code} {resp.text}")
+              raise SystemExit(1)
+          PYEOF
+
+      - name: Upload analysis artifacts
+        if: always() && steps.pr.outputs.found == 'true' && steps.guard.outputs.skip == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-agent-artifacts-${{ github.event.workflow_run.id }}
+          path: |
+            filtered_logs.txt
+            capped_diff.txt
+            agent_report.md
+          retention-days: 7
