@@ -86,6 +86,7 @@ if PROJECT_ROOT not in sys.path:
 # Import real functions after stubs are in place
 from Stock.app import get_stock_price_fig, get_more  # noqa: E402
 from Stock.app import update_data, stock_price, indicators, forecast  # noqa: E402
+from Stock.app import APP_VERSION  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -352,3 +353,18 @@ class TestSVR(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Tests: APP_VERSION
+# ---------------------------------------------------------------------------
+
+class TestAppVersion(unittest.TestCase):
+
+    def test_version_is_string(self):
+        self.assertIsInstance(APP_VERSION, str)
+
+    def test_version_format(self):
+        parts = APP_VERSION.split(".")
+        self.assertEqual(len(parts), 3)
+        self.assertTrue(all(p.isdigit() for p in parts))

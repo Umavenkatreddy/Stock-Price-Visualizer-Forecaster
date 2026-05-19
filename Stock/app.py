@@ -6,8 +6,9 @@ from dash.dependencies import Input, Output, State
 from dash.exceptions import PreventUpdate
 import pandas as pd
 import plotly.express as px
-# model
 from model import prediction
+
+APP_VERSION = "1.0.0"
 
 
 def get_stock_price_fig(df):
