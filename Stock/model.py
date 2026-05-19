@@ -14,7 +14,7 @@ def prediction(stock, n_days):
 
     days = list()
     for i in range(len(df.Day)):
-        days.append([i])
+            days.append([i])
 
     # Splitting the dataset
 
