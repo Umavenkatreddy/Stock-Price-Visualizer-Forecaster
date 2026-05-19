@@ -4,3 +4,5 @@
 *.yaml text eol=lf
 # Force LF for Python files (CRLF causes flake8 E999 SyntaxError on Linux CI)
 *.py text eol=lf
+*.cfg text eol=lf
+*.txt text eol=lf
