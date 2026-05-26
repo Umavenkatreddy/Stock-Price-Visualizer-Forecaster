@@ -17,6 +17,7 @@ env:
   PYTHON_VERSION: "3.11"
   ARTIFACT_NAME: stock-wheel
   COVERAGE_THRESHOLD: 50
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 # =============================================================================
 # STAGE 1 - INIT
@@ -107,6 +108,7 @@ jobs:
             --count
 
       - name: Security scan with bandit
+        id: bandit
         run: |
           bandit -r Stock/ \
             --severity-level medium \
@@ -119,7 +121,7 @@ jobs:
             --confidence-level high
 
       - name: Upload bandit report
-        if: always()
+        if: always() && steps.bandit.outcome != 'skipped'
         uses: actions/upload-artifact@v4
         with:
           name: bandit-security-report

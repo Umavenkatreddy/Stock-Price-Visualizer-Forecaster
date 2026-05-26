@@ -12,6 +12,9 @@ permissions:
   pull-requests: write
   actions: read
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   analyze-failure:
     name: "Analyze CI Failure & Post Report"
@@ -54,7 +57,7 @@ jobs:
             HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
             PR_NUMBER=$(gh api \
               "repos/${REPO}/pulls?state=open&per_page=100" \
-              --jq --arg sha "$HEAD_SHA" \
+              | jq -r --arg sha "$HEAD_SHA" \
               '.[] | select(.head.sha == $sha) | .number' | head -1)
           fi
 
@@ -82,7 +85,7 @@ jobs:
           MARKER="<!-- ci-failure-agent run_id=${RUN_ID} -->"
           EXISTS=$(gh api \
             "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" \
-            --jq --arg marker "$MARKER" \
+            | jq -r --arg marker "$MARKER" \
             '.[] | select(.body | contains($marker)) | .id' | head -1)
           if [[ -n "$EXISTS" ]]; then
             echo "Bot already commented for this run. Skipping."
@@ -183,6 +186,21 @@ jobs:
 
           print(f"Diff size: {len(diff)} chars")
           PYEOF
+
+      # -----------------------------------------------------------------------
+      # Pre-flight: validate ANTHROPIC_API_KEY is set before calling the API
+      # -----------------------------------------------------------------------
+      - name: Validate ANTHROPIC_API_KEY secret
+        if: steps.pr.outputs.found == 'true' && steps.guard.outputs.skip == 'false'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [[ -z "$ANTHROPIC_API_KEY" ]]; then
+            echo "##[error]ANTHROPIC_API_KEY secret is not set."
+            echo "Add it at: https://github.com/${GITHUB_REPOSITORY}/settings/secrets/actions"
+            exit 1
+          fi
+          echo "ANTHROPIC_API_KEY is present."
 
       # -----------------------------------------------------------------------
       # Call Claude API and generate the report
