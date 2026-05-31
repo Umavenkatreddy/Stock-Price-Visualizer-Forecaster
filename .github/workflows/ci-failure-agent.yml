@@ -11,6 +11,7 @@ permissions:
   contents: read
   pull-requests: write
   actions: read
+  models: read          # required to call GitHub Models inference
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -36,7 +37,9 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install anthropic requests
+        # Switched from `anthropic` (paid) to `openai` SDK pointed at the
+        # GitHub Models endpoint (free, uses the workflow's GITHUB_TOKEN).
+        run: pip install openai requests
 
       # -----------------------------------------------------------------------
       # Resolve the PR number from the triggering workflow_run
@@ -188,28 +191,18 @@ jobs:
           PYEOF
 
       # -----------------------------------------------------------------------
-      # Pre-flight: validate ANTHROPIC_API_KEY is set before calling the API
+      # Call GitHub Models (free) and generate the report
+      #
+      # Auth: uses the workflow's built-in GITHUB_TOKEN (no Anthropic key, no
+      # OpenAI account, no billing). The OpenAI SDK is pointed at GitHub's
+      # OpenAI-compatible inference endpoint.
       # -----------------------------------------------------------------------
-      - name: Validate ANTHROPIC_API_KEY secret
-        if: steps.pr.outputs.found == 'true' && steps.guard.outputs.skip == 'false'
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: |
-          if [[ -z "$ANTHROPIC_API_KEY" ]]; then
-            echo "##[error]ANTHROPIC_API_KEY secret is not set."
-            echo "Add it at: https://github.com/${GITHUB_REPOSITORY}/settings/secrets/actions"
-            exit 1
-          fi
-          echo "ANTHROPIC_API_KEY is present."
-
-      # -----------------------------------------------------------------------
-      # Call Claude API and generate the report
-      # -----------------------------------------------------------------------
-      - name: Run Claude analysis
+      - name: Run AI analysis (GitHub Models)
         id: analysis
         if: steps.pr.outputs.found == 'true' && steps.guard.outputs.skip == 'false'
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MODEL_ID: ${{ vars.CI_AGENT_MODEL || 'openai/gpt-4o-mini' }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_URL: ${{ github.event.workflow_run.html_url }}
           WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
@@ -217,7 +210,8 @@ jobs:
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           python3 - << 'PYEOF'
-          import anthropic, os, json, sys
+          import os, sys
+          from openai import OpenAI
 
           with open("filtered_logs.txt") as f:
               logs = f.read()
@@ -228,6 +222,7 @@ jobs:
           workflow = os.environ["WORKFLOW_NAME"]
           branch = os.environ["HEAD_BRANCH"]
           sha = os.environ["HEAD_SHA"][:8]
+          model_id = os.environ["MODEL_ID"]
 
           prompt = f"""You are a CI failure analysis agent. A GitHub Actions workflow just failed on a pull request.
 
@@ -264,20 +259,40 @@ jobs:
 
           Be concise. Do not repeat the logs back verbatim. Do not add sections beyond the four above."""
 
-          client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-          message = client.messages.create(
-              model="claude-sonnet-4-6",
-              max_tokens=1024,
-              messages=[{"role": "user", "content": prompt}]
+          client = OpenAI(
+              base_url="https://models.github.ai/inference",
+              api_key=os.environ["GITHUB_TOKEN"],
           )
 
-          report = message.content[0].text
+          try:
+              resp = client.chat.completions.create(
+                  model=model_id,
+                  messages=[{"role": "user", "content": prompt}],
+                  temperature=0.2,
+                  max_tokens=1024,
+              )
+              report = (resp.choices[0].message.content or "").strip()
+              if not report:
+                  report = "_AI agent produced no output._"
+          except Exception as exc:
+              # Fail soft — still post a comment so the PR author knows we tried.
+              report = (
+                  f"⚠️ The AI agent could not generate a full analysis.\n\n"
+                  f"- Model: `{model_id}`\n"
+                  f"- Error: `{exc}`\n\n"
+                  "Likely causes: GitHub Models not enabled on this org, "
+                  "rate-limit hit, or temporary outage."
+              )
 
           with open("agent_report.md", "w") as f:
               f.write(report)
 
-          print("Claude analysis complete.")
-          print(f"Report length: {len(report)} chars")
+          # Persist the model id for the next step (post-comment) so the
+          # comment footer accurately reflects which model produced this.
+          with open("model_id.txt", "w") as f:
+              f.write(model_id)
+
+          print(f"AI analysis complete. Model={model_id}, Report length={len(report)} chars")
           PYEOF
 
       # -----------------------------------------------------------------------
@@ -294,9 +309,16 @@ jobs:
         run: |
           python3 - << 'PYEOF'
           import os, requests, json
+          from pathlib import Path
 
           with open("agent_report.md") as f:
               report = f.read()
+
+          # Read the model id written by the analysis step (fallback to default).
+          try:
+              model_id = Path("model_id.txt").read_text().strip()
+          except FileNotFoundError:
+              model_id = "openai/gpt-4o-mini"
 
           run_id = os.environ["RUN_ID"]
           run_url = os.environ["RUN_URL"]
@@ -310,7 +332,7 @@ jobs:
           {report}
 
           ---
-          *Generated by CI Failure Agent using Claude. [View full logs]({run_url})*
+          *Generated by CI Failure Agent using GitHub Models (`{model_id}`). [View full logs]({run_url})*
           """
 
           token = os.environ["GH_TOKEN"]
