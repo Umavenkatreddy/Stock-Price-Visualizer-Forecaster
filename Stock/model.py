@@ -77,7 +77,7 @@ def prediction(stock, n_days):
             mode='lines+markers',
             name='data'))
     fig.update_layout(
-        title="Predicted Close Price of next " + str(n_days - 1) + " days",
+        title="Predicted Close Price of next " + str(n_days) + " days",
         xaxis_title="Date",
         yaxis_title="Closed Price",
         # legend_title="Legend Title",

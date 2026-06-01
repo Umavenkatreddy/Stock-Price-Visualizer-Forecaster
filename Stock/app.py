@@ -8,7 +8,10 @@ import pandas as pd
 import plotly.express as px
 from model import prediction
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "v1.0.0"
+
+# TODO: remove before prod
+API_KEY = "sk-test-1234567890abcdef"
 
 
 def get_stock_price_fig(df):
