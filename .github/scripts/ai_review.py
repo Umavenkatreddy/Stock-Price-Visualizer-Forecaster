@@ -1,13 +1,12 @@
 """
-AI PR Review — runs in GitHub Actions, calls GitHub Models (free), and posts
-a single Claude-style review comment on the PR.
+AI PR Review — calls GitHub Models (free) and posts a PR comment.
 
-Auth model:
-  - GITHUB_TOKEN (built-in workflow secret) is used both to:
-      1. Call the GitHub Models inference endpoint (with `models: read`)
-      2. Post the review comment back to the PR (`pull-requests: write`)
+Auth: GITHUB_TOKEN (built-in workflow secret).
+  - POST https://models.github.ai/inference  (with models:read permission)
+  - POST https://api.github.com/repos/.../issues/.../comments  (pull-requests:write)
 
-No Anthropic key, no OpenAI account, no SAP AI Core, no hai proxy. Free.
+Dependencies: openai, requests  (both pinned in the workflow pip install step)
+No PyGithub, no Anthropic SDK, no paid keys.
 """
 
 from __future__ import annotations
@@ -15,41 +14,59 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+import requests as http
 
-from openai import OpenAI
-from github import Github, Auth
+# ---------- startup diagnostics (visible in Actions log) --------------------
+print(f"Python {sys.version}")
+print(f"Script: {__file__}")
+REQUIRED_VARS = ("GITHUB_TOKEN", "GITHUB_REPOSITORY", "PR_NUMBER")
+for v in REQUIRED_VARS:
+    val = os.getenv(v, "")
+    safe = f"[set, len={len(val)}]" if val else "[MISSING]"
+    print(f"  {v}: {safe}")
+print(f"  GITHUB_API_URL: {os.getenv('GITHUB_API_URL', '(not set)')}")
+print(f"  AI_REVIEW_MODEL: {os.getenv('AI_REVIEW_MODEL', '(not set)')}")
 
 
-# ---------- 1. Validate environment ----------------------------------------
+# ---------- 1. Collect env vars -------------------------------------------
 
-REQUIRED = ("GITHUB_TOKEN", "GITHUB_REPOSITORY", "PR_NUMBER")
-missing = [k for k in REQUIRED if not os.getenv(k)]
-if missing:
-    print(f"ERROR: missing env vars: {', '.join(missing)}", file=sys.stderr)
+def _require(name: str) -> str:
+    v = os.getenv(name, "").strip()
+    if not v:
+        print(f"FATAL: env var {name!r} is empty or missing.", file=sys.stderr)
+        sys.exit(1)
+    return v
+
+
+token       = _require("GITHUB_TOKEN")
+repo_full   = _require("GITHUB_REPOSITORY")    # e.g. Umavenkatreddy/Stock-Price-Visualizer-Forecaster
+pr_number   = _require("PR_NUMBER")            # we keep as str, convert later
+api_base    = os.getenv("GITHUB_API_URL", "https://api.github.com").rstrip("/")
+model       = os.getenv("AI_REVIEW_MODEL", "").strip() or "openai/gpt-4o-mini"
+
+# Convert pr_number to int after verification
+try:
+    pr_number_int = int(pr_number)
+except ValueError:
+    print(f"FATAL: PR_NUMBER={pr_number!r} is not an integer.", file=sys.stderr)
     sys.exit(1)
-
-token = os.environ["GITHUB_TOKEN"]
-repo_full = os.environ["GITHUB_REPOSITORY"]
-pr_number = int(os.environ["PR_NUMBER"])
-api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
-model = os.environ.get("AI_REVIEW_MODEL", "openai/gpt-4o-mini")
 
 
 # ---------- 2. Read the diff ------------------------------------------------
 
 DIFF_FILE = Path("pr.diff")
 if not DIFF_FILE.exists() or DIFF_FILE.stat().st_size == 0:
-    print("No diff to review — exiting cleanly.")
+    print("No diff to review — empty or missing pr.diff. Exiting cleanly.")
     sys.exit(0)
 
 diff_text = DIFF_FILE.read_text(encoding="utf-8", errors="replace")
-print(f"Reviewing diff: {len(diff_text)} chars, model={model}")
+print(f"diff size: {len(diff_text)} chars")
 
 
 # ---------- 3. Build the prompt --------------------------------------------
 
-PR_TITLE = os.getenv("PR_TITLE", "(no title)")
-PR_BODY = os.getenv("PR_BODY") or "(no description)"
+PR_TITLE = os.getenv("PR_TITLE", "(no title)").strip()
+PR_BODY  = (os.getenv("PR_BODY") or "(no description)").strip()
 
 SYSTEM_PROMPT = """You are a senior Python code reviewer for a Streamlit/Dash + LSTM/SVR
 stock-forecasting project. Review the supplied unified diff and produce a
@@ -57,59 +74,48 @@ concise, actionable review.
 
 Output format (Markdown):
 
-### 🤖 AI Review Summary
-1–3 sentences on the overall change.
+### Summary
+1-3 sentences on the overall change.
 
-### ✅ Looks good
-- bullet points (or "None" if nothing notable)
+### Looks good
+- bullet points (or "None")
 
-### ⚠️ Issues / Risks
+### Issues / Risks
 For each issue:
-- **<file>:<line-range>** — <short title>
+- **<file>:<line>** - <short title>
   - Why it matters: ...
-  - Suggested fix:
-    ```python
-    <minimal patch or pseudocode>
-    ```
+  - Suggested fix: `<minimal fix>`
 
-### 🧪 Test coverage
-Note any new behavior NOT covered by tests under `tests/`. Write "None" if no gaps.
+### Test coverage
+Note new behavior NOT covered by tests. Write "None" if no gaps.
 
-### 🔒 Security / secrets
-Flag hard-coded credentials, API keys, unsafe `eval`, command/SQL injection.
+### Security
+Flag hard-coded credentials, API keys, unsafe eval, command injection.
 Write "None" if clean.
 
-Rules:
-- Be specific — quote file paths and line numbers from the diff hunk headers.
-- Do NOT repeat the diff back.
-- Keep the whole review under ~400 lines."""
+Rules: be specific, quote file+line numbers, do NOT repeat the diff."""
 
-USER_PROMPT = f"""PR title: {PR_TITLE}
-
-PR description:
-{PR_BODY}
-
-Unified diff (truncated if larger than 150 KB):
-
-```diff
-{diff_text}
-```
-"""
-
-
-# ---------- 4. Call GitHub Models ------------------------------------------
-
-client = OpenAI(
-    base_url="https://models.github.ai/inference",
-    api_key=token,
+USER_PROMPT = (
+    f"PR title: {PR_TITLE}\n\n"
+    f"PR description:\n{PR_BODY}\n\n"
+    f"Unified diff:\n\n```diff\n{diff_text}\n```"
 )
 
+
+# ---------- 4. Call GitHub Models via openai SDK ---------------------------
+
 try:
+    from openai import OpenAI
+    client = OpenAI(
+        base_url="https://models.github.ai/inference",
+        api_key=token,
+    )
+    print(f"Calling model={model} via https://models.github.ai/inference …")
     resp = client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": USER_PROMPT},
+            {"role": "user",   "content": USER_PROMPT},
         ],
         temperature=0.2,
         max_tokens=2000,
@@ -117,40 +123,77 @@ try:
     review_md = (resp.choices[0].message.content or "").strip()
     if not review_md:
         review_md = "_AI review produced no output._"
+    print(f"Model response: {len(review_md)} chars")
+
 except Exception as exc:
-    # Soft fail — still post a comment so the PR author can see what went wrong.
-    print(f"ERROR calling GitHub Models ({model}): {exc}", file=sys.stderr)
+    import traceback
+    traceback.print_exc()
     review_md = (
-        f"⚠️ AI review failed to run.\n\n"
+        f"## AI Review — model call failed\n\n"
         f"- Model: `{model}`\n"
         f"- Error: `{exc}`\n\n"
-        "Likely causes: GitHub Models not enabled on this org, the workflow "
-        "lacks `models: read` permission, or a temporary outage."
+        f"Possible causes: GitHub Models not enabled on this organisation, "
+        f"rate-limit, or temporary outage. "
+        f"Check the [workflow run]({api_base.replace('api.', '')}) for details."
     )
 
 
-# ---------- 5. Post / update the PR comment --------------------------------
-
-gh = Github(auth=Auth.Token(token), base_url=api_url)
-repo = gh.get_repo(repo_full)
-pr = repo.get_pull(pr_number)
+# ---------- 5. Post / update PR comment via REST ---------------------------
 
 MARKER = "<!-- ai-pr-review-bot -->"
 body = (
-    f"{MARKER}\n{review_md}\n\n"
-    f"<sub>🤖 Model: `{model}` · Auto-updates on every push.</sub>"
+    f"{MARKER}\n"
+    f"### AI PR Review\n\n"
+    f"{review_md}\n\n"
+    f"<sub>Model: `{model}` · Updates on every push.</sub>"
 )
 
-# Idempotent: update the existing bot comment if present, else create one.
-existing = None
-for c in pr.get_issue_comments():
-    if c.body and MARKER in c.body:
-        existing = c
-        break
+gh_headers = {
+    "Authorization": f"Bearer {token}",
+    "Accept": "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+}
 
-if existing:
-    existing.edit(body)
-    print(f"Updated existing AI review comment id={existing.id}")
+# List existing PR comments to find a previous bot comment.
+comments_url = f"{api_base}/repos/{repo_full}/issues/{pr_number_int}/comments"
+existing_id  = None
+page = 1
+while True:
+    r = http.get(comments_url, headers=gh_headers, params={"per_page": 100, "page": page})
+    if r.status_code != 200:
+        print(f"WARNING: could not list comments ({r.status_code}): {r.text[:200]}")
+        break
+    comments = r.json()
+    if not comments:
+        break
+    for c in comments:
+        if MARKER in (c.get("body") or ""):
+            existing_id = c["id"]
+            break
+    if existing_id or len(comments) < 100:
+        break
+    page += 1
+
+# Update or create.
+if existing_id:
+    r = http.patch(
+        f"{api_base}/repos/{repo_full}/issues/comments/{existing_id}",
+        headers=gh_headers,
+        json={"body": body},
+    )
+    if r.status_code == 200:
+        print(f"Updated existing AI review comment id={existing_id}")
+    else:
+        print(f"ERROR updating comment: {r.status_code} {r.text[:300]}", file=sys.stderr)
+        sys.exit(1)
 else:
-    new_comment = pr.create_issue_comment(body)
-    print(f"Posted new AI review comment id={new_comment.id}")
+    r = http.post(
+        comments_url,
+        headers=gh_headers,
+        json={"body": body},
+    )
+    if r.status_code == 201:
+        print(f"Posted new AI review comment: {r.json()['html_url']}")
+    else:
+        print(f"ERROR posting comment: {r.status_code} {r.text[:300]}", file=sys.stderr)
+        sys.exit(1)
