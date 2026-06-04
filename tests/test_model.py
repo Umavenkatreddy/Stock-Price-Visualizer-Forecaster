@@ -66,4 +66,12 @@ class TestPredictionMocked(unittest.TestCase):
         _,yf,_=self._call(); _,kw=yf.download.call_args; self.assertEqual(kw.get("period"),"60d")
     def test_scatter(self): _,_,go=self._call(); go.Scatter.assert_called()
 
+
+
+class TestDeliberateFailure(unittest.TestCase):
+    def test_this_will_fail_intentionally(self):
+        # This test is intentionally failing to verify the CI failure agent works.
+        # The agent should detect this failure, analyze the logs, and suggest removing this test.
+        self.assertEqual(1, 999, "Deliberate failure: CI agent test - this should be caught and analyzed")
+
 if __name__=="__main__": unittest.main()
